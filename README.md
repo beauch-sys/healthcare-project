@@ -109,21 +109,6 @@ The QuickSight datasets use **Athena Direct Query** rather than SPICE imports. S
 - Automated failure notifications, recovery testing, and operational monitoring remain future enhancements.
 - Source code and SQL validation queries should be added to `glue_jobs/` and `sql/` from the actual deployed implementation. **No production code is reproduced or fabricated in this starter repository.**
 
-## Repository contents
-
-```text
-healthcare-staffing-analytics/
-├── README.md
-├── docs/
-│   ├── data-model.md
-│   ├── pipeline-workflow.md
-│   ├── data-quality.md
-│   └── dashboard.md
-├── glue_jobs/
-│   └── README.md
-└── sql/
-    └── README.md
-```
 
 ## Security and reproducibility
 
