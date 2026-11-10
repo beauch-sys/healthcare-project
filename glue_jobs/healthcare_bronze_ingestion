@@ -1,0 +1,1176 @@
+
+import re
+import sys
+import json
+import boto3
+import hashlib
+
+from botocore.exceptions import ClientError
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import input_file_name
+
+# --------------------------------------------------
+# Job configuration
+# --------------------------------------------------
+
+args = getResolvedOptions(
+    sys.argv,
+    [
+        "JOB_NAME",
+        "S3_BUCKET",
+        "CATALOG_DATABASE",
+        "MANIFEST_PREFIX",
+        "BRONZE_PREFIX",
+        "STATE_KEY"
+    ]
+)
+
+
+# --------------------------------------------------
+# Detect AWS Glue Workflow execution context
+# --------------------------------------------------
+
+workflow_args = {}
+
+if (
+    "--WORKFLOW_NAME" in sys.argv
+    and "--WORKFLOW_RUN_ID" in sys.argv
+):
+    workflow_args = getResolvedOptions(
+        sys.argv,
+        ["WORKFLOW_NAME", "WORKFLOW_RUN_ID"]
+    )
+
+    print(
+        f"Running in workflow: {workflow_args['WORKFLOW_NAME']}"
+    )
+    print(
+        f"Workflow run: {workflow_args['WORKFLOW_RUN_ID']}"
+    )
+
+BUCKET = args["S3_BUCKET"]
+DATABASE = args["CATALOG_DATABASE"]
+MANIFEST_PREFIX = args["MANIFEST_PREFIX"]
+BRONZE_PREFIX = args["BRONZE_PREFIX"]
+state_key = args["STATE_KEY"]
+
+
+# --------------------------------------------------
+# Prevent mixed production/test configurations
+# --------------------------------------------------
+
+if DATABASE == "healthcare_bronze_test":
+
+    if BRONZE_PREFIX != "bronze-test":
+        raise RuntimeError(
+            "Test database requires BRONZE_PREFIX=bronze-test"
+        )
+
+    if state_key != "temp/pipeline-state-test/source-state.json":
+        raise RuntimeError(
+            "Test database requires the test pipeline baseline"
+        )
+
+elif DATABASE == "healthcare_bronze":
+
+    if BRONZE_PREFIX != "bronze":
+        raise RuntimeError(
+            "Production database requires BRONZE_PREFIX=bronze"
+        )
+
+    if state_key != "temp/pipeline-state/source-state.json":
+        raise RuntimeError(
+            "Production database requires the production baseline"
+        )
+
+else:
+    raise RuntimeError(
+        f"Unrecognized Bronze Catalog database: {DATABASE}"
+    )
+
+DATASETS = [
+    "pbj_daily_staffing",
+    "data_collection_intervals",
+    "provider_info",
+    "quality_measures_mds",
+    "state_us_averages"
+]
+
+s3 = boto3.client("s3", region_name="us-east-1")
+
+sc = SparkContext.getOrCreate()
+spark = SparkSession.builder.getOrCreate()
+
+spark.sparkContext._jsc.hadoopConfiguration().set(
+    "mapreduce.fileoutputcommitter.marksuccessfuljobs",
+    "true"
+)
+
+# --------------------------------------------------
+# Locate the latest completed ingestion manifest
+# --------------------------------------------------
+
+
+def find_latest_manifest():
+    paginator = s3.get_paginator("list_objects_v2")
+    manifests = []
+
+    for page in paginator.paginate(
+        Bucket=BUCKET,
+        Prefix=MANIFEST_PREFIX
+    ):
+        for obj in page.get("Contents", []):
+            key = obj["Key"]
+
+            if not key.endswith("/manifest.json"):
+                continue
+
+            # Extract the run ID from the manifest path.
+            run_id = key.split("/")[-2]
+
+            # Only accept production timestamp run IDs.
+            if not re.fullmatch(r"\d{8}T\d{6}Z", run_id):
+                continue
+
+            manifests.append(key)
+
+    if not manifests:
+        raise RuntimeError(
+            "No production ingestion manifests found."
+        )
+
+    # Production run IDs sort chronologically.
+    return max(manifests)
+
+
+# --------------------------------------------------
+# Select ingestion manifest
+# Priority:
+# 1. Current workflow run
+# 2. Explicit MANIFEST_KEY
+# 3. Latest production manifest
+# --------------------------------------------------
+
+if workflow_args:
+
+    glue_client = boto3.client(
+        "glue",
+        region_name="us-east-1"
+    )
+
+    workflow_properties = (
+        glue_client.get_workflow_run_properties(
+            Name=workflow_args["WORKFLOW_NAME"],
+            RunId=workflow_args["WORKFLOW_RUN_ID"]
+        )["RunProperties"]
+    )
+
+    manifest_key = workflow_properties.get("MANIFEST_KEY")
+
+    if not manifest_key:
+        raise RuntimeError(
+            "Current workflow run has no MANIFEST_KEY property."
+        )
+
+    print(
+        f"Using workflow ingestion manifest: {manifest_key}"
+    )
+
+elif "--MANIFEST_KEY" in sys.argv:
+
+    manifest_args = getResolvedOptions(
+        sys.argv,
+        ["MANIFEST_KEY"]
+    )
+
+    manifest_key = manifest_args["MANIFEST_KEY"]
+
+    print(
+        f"Using explicitly supplied manifest: {manifest_key}"
+    )
+
+else:
+
+    if (
+        DATABASE == "healthcare_bronze_test"
+        and BRONZE_PREFIX == "bronze-test"
+    ):
+        raise RuntimeError(
+            "Test environment requires an explicit "
+            "--MANIFEST_KEY parameter."
+        )
+
+    manifest_key = find_latest_manifest()
+
+    print(
+        "WARNING: No MANIFEST_KEY supplied. "
+        "Using latest completed ingestion manifest."
+    )
+
+# Prevent reading objects outside the ingestion area.
+if (
+    not manifest_key.startswith(MANIFEST_PREFIX)
+    or not manifest_key.endswith("/manifest.json")
+):
+    raise RuntimeError(
+        f"Invalid ingestion manifest key: {manifest_key}"
+    )
+
+manifest_obj = s3.get_object(
+    Bucket=BUCKET,
+    Key=manifest_key
+)
+
+manifest = json.loads(
+    manifest_obj["Body"].read().decode("utf-8")
+)
+
+if manifest.get("status") != "complete":
+    raise RuntimeError("Latest ingestion manifest is not complete.")
+
+if set(manifest.get("datasets", {})) != set(DATASETS):
+    raise RuntimeError(
+        "Manifest does not contain exactly the five required datasets."
+    )
+
+run_id = manifest["run_id"]
+
+expected_manifest_key = (
+    f"{MANIFEST_PREFIX.rstrip('/')}/{run_id}/manifest.json"
+)
+
+if manifest_key != expected_manifest_key:
+    raise RuntimeError(
+        f"Manifest run ID does not match its S3 path: "
+        f"{manifest_key}"
+    )
+
+if (
+    DATABASE == "healthcare_bronze_test"
+    and BRONZE_PREFIX == "bronze-test"
+):
+    expected_test_prefix = (
+        "temp/drive-ingestion/test-"
+    )
+
+    if not manifest_key.startswith(expected_test_prefix):
+        raise RuntimeError(
+            "Test Bronze runs must use a dedicated "
+            "test ingestion manifest."
+        )
+
+    print("TEST MANIFEST LOCATION VALIDATED")
+    
+print(f"Processing ingestion run: {run_id}")
+print(f"Manifest: s3://{BUCKET}/{manifest_key}")
+
+
+# --------------------------------------------------
+# Detect Bronze source changes
+# --------------------------------------------------
+
+LEGACY_RUN_ID = "20261106T180437Z"
+
+try:
+    state_response = s3.get_object(
+        Bucket=BUCKET,
+        Key=state_key
+    )
+
+    previous_state = json.loads(
+        state_response["Body"].read().decode("utf-8")
+    )
+
+    print("Loaded last successful pipeline state.")
+
+except ClientError as e:
+    if e.response["Error"]["Code"] in (
+        "NoSuchKey", "404"
+    ):
+        raise RuntimeError(
+            "Successful pipeline baseline is missing. "
+            "Cannot safely determine Bronze changes."
+        )
+    raise
+
+
+# --------------------------------------------------
+# Compare manifest versions with successful baseline
+# --------------------------------------------------
+
+if previous_state.get("status") != "success":
+    raise RuntimeError(
+        "Pipeline baseline does not have success status."
+    )
+
+
+# --------------------------------------------------
+# Create reproducible source-version fingerprints
+# --------------------------------------------------
+
+SOURCE_VERSION_FIELDS = (
+    "google_drive_file_id",
+    "google_drive_modified_time",
+    "google_drive_size"
+)
+
+def source_fingerprint(source):
+    version = {
+        field: str(source[field])
+        for field in SOURCE_VERSION_FIELDS
+    }
+
+    canonical_json = json.dumps(
+        version,
+        sort_keys=True,
+        separators=(",", ":")
+    )
+
+    return hashlib.sha256(
+        canonical_json.encode("utf-8")
+    ).hexdigest()
+
+previous_datasets = previous_state["datasets"]
+
+changed_bronze_datasets = []
+
+for dataset in DATASETS:
+
+    source = manifest["datasets"][dataset]
+    previous = previous_datasets.get(dataset)
+
+    required_fields = (
+        "google_drive_file_id",
+        "google_drive_modified_time",
+        "google_drive_size"
+    )
+
+    missing_fields = [
+        field for field in required_fields
+        if source.get(field) is None
+    ]
+
+    if missing_fields:
+        raise RuntimeError(
+            f"Manifest missing source metadata for "
+            f"{dataset}: {missing_fields}"
+        )
+
+    current_version = {
+        field: str(source[field])
+        for field in required_fields
+    }
+
+    previous_version = (
+        {
+            field: str(previous.get(field))
+            for field in required_fields
+        }
+        if previous is not None
+        else None
+    )
+
+    if current_version != previous_version:
+
+        changed_bronze_datasets.append(dataset)
+
+        if not source.get("changed"):
+            raise RuntimeError(
+                f"{dataset} differs from the successful "
+                f"baseline but was not marked changed "
+                f"by ingestion."
+            )
+
+        if not source.get("staging_s3_key"):
+            raise RuntimeError(
+                f"Missing staged source for {dataset}"
+            )
+
+        print(f"BRONZE CHANGE DETECTED: {dataset}")
+
+    else:
+        print(f"BRONZE SOURCE UNCHANGED: {dataset}")
+
+print(
+    f"Bronze change detection: "
+    f"{len(changed_bronze_datasets)} "
+    f"of {len(DATASETS)} datasets changed."
+)
+
+
+# --------------------------------------------------
+# Skip Bronze if sources are unchanged and
+# existing published snapshots are valid
+# --------------------------------------------------
+
+if not changed_bronze_datasets:
+
+    print("No source changes detected.")
+    print("Validating existing Bronze publications.")
+
+    glue = boto3.client("glue", region_name="us-east-1")
+
+    for dataset in DATASETS:
+
+        table_name = f"{dataset}_staging"
+
+        response = glue.get_table(
+            DatabaseName=DATABASE,
+            Name=table_name
+        )
+
+        location = response["Table"][
+            "StorageDescriptor"
+        ]["Location"]
+
+        expected_prefix = (
+            f"s3://{BUCKET}/{BRONZE_PREFIX}/{dataset}/runs/"
+        )
+        
+        legacy_test_location = (
+            f"s3://{BUCKET}/bronze/{dataset}/"
+            f"runs/{LEGACY_RUN_ID}/"
+        )
+        
+        valid_location = location.startswith(expected_prefix)
+        
+        if (
+            DATABASE == "healthcare_bronze_test"
+            and BRONZE_PREFIX == "bronze-test"
+            and location.rstrip("/") == legacy_test_location.rstrip("/")
+        ):
+            valid_location = True
+        
+        if not valid_location:
+            raise RuntimeError(
+                f"Unexpected Bronze location for "
+                f"{table_name}: {location}"
+            )
+
+        snapshot_prefix = location.replace(
+            f"s3://{BUCKET}/", "", 1
+        ).rstrip("/") + "/"
+
+        objects = []
+
+        paginator = s3.get_paginator("list_objects_v2")
+
+        for page in paginator.paginate(
+            Bucket=BUCKET,
+            Prefix=snapshot_prefix
+        ):
+            objects.extend(page.get("Contents", []))
+
+        parquet_files = [
+            obj for obj in objects
+            if obj["Key"].endswith(".parquet")
+            and obj["Size"] > 0
+        ]
+
+        if not parquet_files:
+            raise RuntimeError(
+                f"No valid Parquet files for "
+                f"{table_name}"
+            )
+
+        snapshot_run_id = snapshot_prefix.rstrip(
+            "/"
+        ).split("/")[-1]
+
+
+        # --------------------------------------------------
+        # Verify published snapshot source lineage
+        # --------------------------------------------------
+
+        if snapshot_run_id == LEGACY_RUN_ID:
+
+            legacy_prefix = (
+                "bronze"
+                if (
+                    DATABASE == "healthcare_bronze_test"
+                    and BRONZE_PREFIX == "bronze-test"
+                )
+                else BRONZE_PREFIX
+            )
+            
+            expected_location = (
+                f"s3://{BUCKET}/{legacy_prefix}/{dataset}/"
+                f"runs/{LEGACY_RUN_ID}/"
+            )
+
+            if location.rstrip("/") != expected_location.rstrip("/"):
+                raise RuntimeError(
+                    f"Unexpected legacy location: {dataset}"
+                )
+
+            print(
+                f"VALIDATED LEGACY LINEAGE: {dataset}"
+            )
+
+        else:
+
+            metadata_key = (
+                f"{snapshot_prefix}_source_version.json"
+            )
+
+            print(f"Dataset being validated: {dataset}")
+            print(f"Looking for metadata: s3://{BUCKET}/{metadata_key}")
+            
+            metadata_response = s3.get_object(
+                Bucket=BUCKET,
+                Key=metadata_key
+            )
+
+            snapshot_metadata = json.loads(
+                metadata_response["Body"].read().decode("utf-8")
+            )
+
+            expected_fingerprint = source_fingerprint(
+                previous_datasets[dataset]
+            )
+
+            if (
+                snapshot_metadata.get("dataset") != dataset
+                or snapshot_metadata.get("ingestion_run_id")
+                   != snapshot_run_id
+                or snapshot_metadata.get("source_fingerprint")
+                   != expected_fingerprint
+            ):
+                raise RuntimeError(
+                    f"Published Bronze snapshot does not "
+                    f"match successful baseline: {dataset}"
+                )
+
+            print(
+                f"VALIDATED SOURCE FINGERPRINT: {dataset}"
+            )
+
+        if snapshot_run_id != LEGACY_RUN_ID:
+            s3.head_object(
+                Bucket=BUCKET,
+                Key=f"{snapshot_prefix}_SUCCESS"
+            )
+
+        existing_df = spark.read.parquet(location)
+
+        if existing_df.limit(1).count() == 0:
+            raise RuntimeError(
+                f"Published Bronze snapshot is empty: "
+                f"{table_name}"
+            )
+
+        print(
+            f"VALIDATED EXISTING: {table_name} "
+            f"-> {location}"
+        )
+
+    print(
+        "BRONZE SKIPPED: All five sources unchanged "
+        "and existing snapshots validated."
+    )
+
+    skip_bronze = True
+    
+else:
+    skip_bronze = False
+
+
+if not skip_bronze:
+    # --------------------------------------------------
+    # Read and validate all five source CSVs
+    # --------------------------------------------------
+    
+    dataframes = {}
+    
+    for dataset in DATASETS:
+    
+        if dataset not in changed_bronze_datasets:
+            print(
+                f"SKIPPED CSV READ: {dataset} "
+                f"(source unchanged)"
+            )
+            continue
+    
+        
+        # --------------------------------------------------
+        # Read the exact source version from ingestion
+        # --------------------------------------------------
+        
+        source_info = manifest["datasets"][dataset]
+        
+        source_key = source_info.get("staging_s3_key")
+        
+        if not source_key:
+            raise RuntimeError(
+                f"Missing run-specific staging file for changed "
+                f"dataset: {dataset}. "
+                f"Manifest run: {run_id}"
+            )
+        
+        expected_prefix = (
+            f"temp/drive-ingestion/{run_id}/{dataset}/"
+        )
+        
+        if not source_key.startswith(expected_prefix):
+            raise RuntimeError(
+                f"Unexpected staging location for {dataset}: "
+                f"{source_key}"
+            )
+        
+        # Verify the staged file exists before Spark reads it.
+        s3.head_object(
+            Bucket=BUCKET,
+            Key=source_key
+        )
+        
+        source_path = f"s3://{BUCKET}/{source_key}"
+        
+        print(
+            f"Reading changed dataset {dataset} "
+            f"from immutable ingestion staging: {source_path}"
+        )
+
+    
+        df = (
+            spark.read
+            .option("header", "true")
+            .option("inferSchema", "false")
+            .option("mode", "FAILFAST")
+            .option("multiLine", "true")
+            .option("quote", '"')
+            .option("escape", '"')
+            .csv(source_path)
+        )
+    
+        if not df.columns:
+            raise RuntimeError(
+                f"No columns found in dataset: {dataset}"
+            )
+    
+        # Preserve raw values as strings in Bronze.
+        df = df.withColumn(
+            "source_file",
+            input_file_name()
+        )
+    
+        row_count = df.count()
+    
+        if row_count == 0:
+            raise RuntimeError(
+                f"Dataset is empty: {dataset}"
+            )
+    
+        print(
+            f"{dataset}: {row_count} rows, "
+            f"{len(df.columns)} columns"
+        )
+    
+        dataframes[dataset] = df
+    
+    
+    
+    # --------------------------------------------------
+    # Write or reuse completed Parquet snapshots
+    # --------------------------------------------------
+    
+    for dataset, df in dataframes.items():
+    
+        prefix = f"{BRONZE_PREFIX}/{dataset}/runs/{run_id}/"
+        output_path = f"s3://{BUCKET}/{prefix}"
+    
+        print(f"Checking Bronze snapshot: {dataset}")
+    
+        # Look for any existing objects in this snapshot.
+        response = s3.list_objects_v2(
+            Bucket=BUCKET,
+            Prefix=prefix,
+            MaxKeys=1
+        )
+    
+        snapshot_exists = response.get("KeyCount", 0) > 0
+    
+        if snapshot_exists:
+    
+            # Verify that Parquet files exist.
+            objects = []
+    
+            paginator = s3.get_paginator("list_objects_v2")
+    
+            for page in paginator.paginate(
+                Bucket=BUCKET,
+                Prefix=prefix
+            ):
+                objects.extend(page.get("Contents", []))
+    
+            # Require a completion marker for all new snapshots.
+            if run_id != LEGACY_RUN_ID:
+                s3.head_object(
+                    Bucket=BUCKET,
+                    Key=f"{prefix}_SUCCESS"
+                )
+                
+            parquet_files = [
+                obj for obj in objects
+                if obj["Key"].endswith(".parquet")
+                and obj["Size"] > 0
+            ]
+    
+            if not parquet_files:
+                raise RuntimeError(
+                    f"No valid Parquet files found: {dataset}"
+                )
+    
+    
+            # --------------------------------------------------
+            # Verify existing snapshot matches requested source
+            # --------------------------------------------------
+    
+            metadata_key = f"{prefix}_source_version.json"
+    
+            metadata_response = s3.get_object(
+                Bucket=BUCKET,
+                Key=metadata_key
+            )
+    
+            snapshot_metadata = json.loads(
+                metadata_response["Body"].read().decode("utf-8")
+            )
+    
+            expected_fingerprint = source_fingerprint(
+                manifest["datasets"][dataset]
+            )
+    
+            if snapshot_metadata.get("dataset") != dataset:
+                raise RuntimeError(
+                    f"Existing snapshot dataset mismatch: {dataset}"
+                )
+    
+            if snapshot_metadata.get("ingestion_run_id") != run_id:
+                raise RuntimeError(
+                    f"Existing snapshot run mismatch: {dataset}"
+                )
+    
+            if (
+                snapshot_metadata.get("source_fingerprint")
+                != expected_fingerprint
+            ):
+                raise RuntimeError(
+                    f"Existing snapshot source mismatch: {dataset}. "
+                    f"Refusing to reuse an incorrect snapshot."
+                )
+    
+            print(
+                f"EXISTING SNAPSHOT FINGERPRINT VALIDATED: {dataset}"
+            )
+    
+            # Confirm Spark can read the existing snapshot.
+            existing_df = spark.read.parquet(output_path)
+    
+            if existing_df.limit(1).count() == 0:
+                raise RuntimeError(
+                    f"Existing snapshot is empty: {dataset}"
+                )
+    
+            print(
+                f"Existing snapshot validated: {dataset}"
+            )
+    
+        else:
+        
+            print(f"Writing new snapshot: {dataset}")
+        
+            (
+                df.write
+                .mode("errorifexists")
+                .parquet(output_path)
+            )
+        
+            # Record the exact source version used.
+            source_info = manifest["datasets"][dataset]
+        
+            source_metadata = {
+                "dataset": dataset,
+                "ingestion_run_id": run_id,
+                "source_fingerprint": source_fingerprint(
+                    source_info
+                ),
+                "google_drive_file_id": (
+                    source_info["google_drive_file_id"]
+                ),
+                "google_drive_modified_time": (
+                    source_info["google_drive_modified_time"]
+                ),
+                "google_drive_size": (
+                    source_info["google_drive_size"]
+                ),
+                "staging_s3_key": (
+                    source_info["staging_s3_key"]
+                )
+            }
+        
+            metadata_key = f"{prefix}_source_version.json"
+        
+            s3.put_object(
+                Bucket=BUCKET,
+                Key=metadata_key,
+                Body=json.dumps(
+                    source_metadata,
+                    indent=2
+                ).encode("utf-8"),
+                ContentType="application/json"
+            )
+        
+            print(
+                f"Source-version metadata written: "
+                f"s3://{BUCKET}/{metadata_key}"
+            )
+        
+            print(f"Finished writing: {dataset}")
+
+    
+    
+    # --------------------------------------------------
+    # Validate changed and unchanged Bronze snapshots
+    # --------------------------------------------------
+    
+    snapshot_locations = {}
+    
+    glue = boto3.client("glue", region_name="us-east-1")
+    
+    for dataset in DATASETS:
+    
+        if dataset in changed_bronze_datasets:
+    
+            # Changed dataset: use current ingestion run.
+            prefix = f"{BRONZE_PREFIX}/{dataset}/runs/{run_id}/"
+            output_path = f"s3://{BUCKET}/{prefix}"
+    
+            print(f"Validating NEW snapshot: {dataset}")
+    
+        else:
+    
+            # Unchanged dataset: reuse published snapshot.
+            table_name = f"{dataset}_staging"
+    
+            response = glue.get_table(
+                DatabaseName=DATABASE,
+                Name=table_name
+            )
+    
+            output_path = response["Table"][
+                "StorageDescriptor"
+            ]["Location"]
+    
+            expected_prefix = (
+                f"s3://{BUCKET}/{BRONZE_PREFIX}/{dataset}/runs/"
+            )
+            
+            legacy_test_prefix = (
+                f"s3://{BUCKET}/bronze/{dataset}/runs/"
+            )
+            
+            valid_location = output_path.startswith(expected_prefix)
+            
+            if (
+                DATABASE == "healthcare_bronze_test"
+                and BRONZE_PREFIX == "bronze-test"
+                and output_path.rstrip("/") == (
+                    f"{legacy_test_prefix}{LEGACY_RUN_ID}"
+                ).rstrip("/")
+            ):
+                valid_location = True
+            
+            if not valid_location:
+                raise RuntimeError(
+                    f"Unexpected published location for "
+                    f"{dataset}: {output_path}"
+                )
+    
+            prefix = output_path.replace(
+                f"s3://{BUCKET}/", "", 1
+            ).rstrip("/") + "/"
+    
+            print(f"Reusing EXISTING snapshot: {dataset}")
+    
+        # Require completion markers for nonlegacy snapshots.
+        snapshot_run_id = prefix.rstrip("/").split("/")[-1]
+    
+    
+        # --------------------------------------------------
+        # Validate source lineage for this Bronze snapshot
+        # --------------------------------------------------
+    
+        metadata_key = f"{prefix}_source_version.json"
+    
+        if snapshot_run_id == LEGACY_RUN_ID:
+    
+            # Legacy snapshots predate fingerprint metadata.
+            # Only accept the established successful baseline.
+    
+            if dataset in changed_bronze_datasets:
+                raise RuntimeError(
+                    f"Changed dataset cannot reuse legacy "
+                    f"snapshot: {dataset}"
+                )
+    
+            legacy_prefix = (
+                "bronze"
+                if (
+                    DATABASE == "healthcare_bronze_test"
+                    and BRONZE_PREFIX == "bronze-test"
+                )
+                else BRONZE_PREFIX
+            )
+
+            expected_location = (
+                f"s3://{BUCKET}/{legacy_prefix}/{dataset}/"
+                f"runs/{LEGACY_RUN_ID}/"
+            )
+    
+            if output_path.rstrip("/") != expected_location.rstrip("/"):
+                raise RuntimeError(
+                    f"Unexpected legacy snapshot location "
+                    f"for {dataset}: {output_path}"
+                )
+    
+            print(f"VALIDATED LEGACY LINEAGE: {dataset}")
+    
+        else:
+    
+            # All newer snapshots require source metadata.
+            metadata_response = s3.get_object(
+                Bucket=BUCKET,
+                Key=metadata_key
+            )
+    
+            snapshot_metadata = json.loads(
+                metadata_response["Body"].read().decode("utf-8")
+            )
+    
+            if snapshot_metadata.get("dataset") != dataset:
+                raise RuntimeError(
+                    f"Snapshot dataset mismatch: {dataset}"
+                )
+    
+            if (
+                snapshot_metadata.get("ingestion_run_id")
+                != snapshot_run_id
+            ):
+                raise RuntimeError(
+                    f"Snapshot run ID mismatch: {dataset}"
+                )
+    
+            if dataset in changed_bronze_datasets:
+                expected_source = manifest["datasets"][dataset]
+            else:
+                expected_source = previous_datasets[dataset]
+    
+            expected_fingerprint = source_fingerprint(
+                expected_source
+            )
+    
+            if (
+                snapshot_metadata.get("source_fingerprint")
+                != expected_fingerprint
+            ):
+                raise RuntimeError(
+                    f"Source fingerprint mismatch for "
+                    f"{dataset}. Snapshot does not match "
+                    f"the expected source version."
+                )
+    
+            print(f"VALIDATED SOURCE FINGERPRINT: {dataset}")
+
+    
+        if snapshot_run_id != LEGACY_RUN_ID:
+            s3.head_object(
+                Bucket=BUCKET,
+                Key=f"{prefix}_SUCCESS"
+            )
+    
+        # Check all objects, including paginated results.
+        parquet_found = False
+    
+        paginator = s3.get_paginator("list_objects_v2")
+    
+        for page in paginator.paginate(
+            Bucket=BUCKET,
+            Prefix=prefix
+        ):
+            if any(
+                obj["Key"].endswith(".parquet")
+                and obj["Size"] > 0
+                for obj in page.get("Contents", [])
+            ):
+                parquet_found = True
+                break
+    
+        if not parquet_found:
+            raise RuntimeError(
+                f"No valid Parquet files found for {dataset}"
+            )
+    
+        # Confirm Spark can read the snapshot.
+        snapshot_df = spark.read.parquet(output_path)
+    
+        if snapshot_df.limit(1).count() == 0:
+            raise RuntimeError(
+                f"Empty Bronze snapshot: {dataset}"
+            )
+    
+        snapshot_locations[dataset] = output_path
+    
+        print(
+            f"VALIDATED: {dataset} -> {output_path}"
+        )
+    
+    print("All five Bronze snapshots validated.")
+
+    
+    # --------------------------------------------------
+    # Update Glue Catalog for changed datasets only
+    # --------------------------------------------------
+    
+    glue = boto3.client("glue", region_name="us-east-1")
+    
+    original_tables = {}
+    updated_datasets = []
+    
+    try:
+        # Save existing definitions for changed tables.
+        for dataset in changed_bronze_datasets:
+    
+            table_name = f"{dataset}_staging"
+    
+            response = glue.get_table(
+                DatabaseName=DATABASE,
+                Name=table_name
+            )
+    
+            original_tables[dataset] = response["Table"]
+    
+        # Publish only changed datasets.
+        for dataset in changed_bronze_datasets:
+    
+            table_name = f"{dataset}_staging"
+            table = original_tables[dataset]
+    
+            table_input = {
+                "Name": table["Name"],
+                "StorageDescriptor": {
+                    **table["StorageDescriptor"],
+                    "Columns": [
+                        {
+                            "Name": field.name,
+                            "Type": field.dataType.simpleString()
+                        }
+                        for field in dataframes[dataset].schema.fields
+                    ]
+                },
+                "TableType": table.get(
+                    "TableType",
+                    "EXTERNAL_TABLE"
+                ),
+                "Parameters": table.get("Parameters", {})
+            }
+    
+            table_input["StorageDescriptor"]["Location"] = (
+                snapshot_locations[dataset]
+            )
+    
+            glue.update_table(
+                DatabaseName=DATABASE,
+                TableInput=table_input
+            )
+    
+            updated_datasets.append(dataset)
+    
+            print(
+                f"Published CHANGED {table_name}: "
+                f"{snapshot_locations[dataset]}"
+            )
+    
+    except Exception:
+    
+        print("Publication failed. Attempting rollback.")
+    
+        for dataset in reversed(updated_datasets):
+    
+            table = original_tables[dataset]
+    
+            rollback_input = {
+                "Name": table["Name"],
+                "StorageDescriptor": table["StorageDescriptor"],
+                "TableType": table.get(
+                    "TableType",
+                    "EXTERNAL_TABLE"
+                ),
+                "Parameters": table.get("Parameters", {})
+            }
+    
+            try:
+                glue.update_table(
+                    DatabaseName=DATABASE,
+                    TableInput=rollback_input
+                )
+    
+                print(f"Rolled back {dataset}")
+    
+            except Exception as rollback_error:
+                print(
+                    f"Rollback failed for {dataset}: "
+                    f"{rollback_error}"
+                )
+    
+        raise
+    
+    print(
+        f"Bronze publication completed: "
+        f"{len(updated_datasets)} tables updated, "
+        f"{len(DATASETS) - len(updated_datasets)} unchanged."
+    )
+
+
+# --------------------------------------------------
+# Publish Bronze execution status for orchestration
+# --------------------------------------------------
+
+bronze_status = {
+    "run_id": run_id,
+    "status": "success",
+    "changes_detected": not skip_bronze,
+    "changed_datasets": sorted(changed_bronze_datasets),
+    "bronze_processed": not skip_bronze,
+    "catalog_database": DATABASE,
+    "bronze_prefix": BRONZE_PREFIX
+}
+
+status_key = (
+    f"temp/pipeline-status/{run_id}/bronze-status.json"
+)
+
+s3.put_object(
+    Bucket=BUCKET,
+    Key=status_key,
+    Body=json.dumps(
+        bronze_status,
+        indent=2
+    ).encode("utf-8"),
+    ContentType="application/json"
+)
+
+print(
+    f"Bronze execution status written: "
+    f"s3://{BUCKET}/{status_key}"
+)
+
+print(
+    "BRONZE COMPLETE: "
+    + (
+        "Source changes processed."
+        if not skip_bronze
+        else "No changes; downstream processing unnecessary."
+    )
+)
