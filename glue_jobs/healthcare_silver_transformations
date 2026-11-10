@@ -1,0 +1,2127 @@
+
+import sys
+import json
+import boto3
+
+from functools import reduce
+from datetime import datetime, timezone
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from pyspark.sql import SparkSession
+from pyspark.sql import functions as F
+
+# Job parameters
+args = getResolvedOptions(
+    sys.argv,
+    [
+        "JOB_NAME",
+        "S3_BUCKET",
+        "BRONZE_DATABASE",
+        "SILVER_DATABASE",
+        "SILVER_PREFIX"
+    ]
+)
+
+BUCKET = args["S3_BUCKET"]
+BRONZE_DATABASE = args["BRONZE_DATABASE"]
+SILVER_DATABASE = args["SILVER_DATABASE"]
+SILVER_PREFIX = args["SILVER_PREFIX"]
+
+
+# ----------------------------------------
+# Enforce production/test isolation
+# ----------------------------------------
+
+if BRONZE_DATABASE == "healthcare_bronze_test":
+
+    if SILVER_DATABASE != "healthcare_silver_test":
+        raise RuntimeError(
+            "Test Bronze requires the test Silver database."
+        )
+
+    if SILVER_PREFIX != "silver-test":
+        raise RuntimeError(
+            "Test Bronze requires SILVER_PREFIX=silver-test."
+        )
+
+elif BRONZE_DATABASE == "healthcare_bronze":
+
+    if SILVER_DATABASE != "healthcare_silver":
+        raise RuntimeError(
+            "Production Bronze requires the production Silver database."
+        )
+
+    if SILVER_PREFIX != "silver":
+        raise RuntimeError(
+            "Production Bronze requires SILVER_PREFIX=silver."
+        )
+
+else:
+    raise RuntimeError(
+        f"Unexpected Bronze database: {BRONZE_DATABASE}"
+    )
+
+
+# ----------------------------------------
+# Skip Silver when Bronze found no changes
+# ----------------------------------------
+
+processing_required = True
+
+if "--WORKFLOW_NAME" in sys.argv and "--WORKFLOW_RUN_ID" in sys.argv:
+
+    workflow_args = getResolvedOptions(
+        sys.argv,
+        ["WORKFLOW_NAME", "WORKFLOW_RUN_ID"]
+    )
+
+    glue_client = boto3.client("glue", region_name="us-east-1")
+    s3_client = boto3.client("s3", region_name="us-east-1")
+
+    workflow_properties = glue_client.get_workflow_run_properties(
+        Name=workflow_args["WORKFLOW_NAME"],
+        RunId=workflow_args["WORKFLOW_RUN_ID"]
+    )["RunProperties"]
+
+    ingestion_run_id = workflow_properties.get("INGESTION_RUN_ID")
+
+    if not ingestion_run_id:
+        raise RuntimeError(
+            "Workflow is missing INGESTION_RUN_ID."
+        )
+
+    status_key = (
+        f"temp/pipeline-status/"
+        f"{ingestion_run_id}/bronze-status.json"
+    )
+
+    status_object = s3_client.get_object(
+        Bucket=BUCKET,
+        Key=status_key
+    )
+
+    bronze_status = json.loads(
+        status_object["Body"].read().decode("utf-8")
+    )
+
+    if bronze_status.get("run_id") != ingestion_run_id:
+        raise RuntimeError(
+            "Bronze status run ID does not match this workflow."
+        )
+
+    if bronze_status.get("status") != "success":
+        raise RuntimeError(
+            "Bronze did not report successful completion."
+        )
+
+    changes_detected = bronze_status.get("changes_detected")
+
+    if not isinstance(changes_detected, bool):
+        raise RuntimeError(
+            "Bronze status has an invalid changes_detected value."
+        )
+
+    if bronze_status.get("bronze_processed") is not changes_detected:
+        raise RuntimeError(
+            "Bronze processing status is inconsistent."
+        )
+
+    processing_required = changes_detected
+    
+    if processing_required:
+        print(
+            "Bronze changes detected. "
+            "Proceeding with Silver transformations."
+        )
+    else:
+        print(
+            "No Bronze changes detected. "
+            "Skipping all Silver transformations."
+        )
+
+else:
+    print(
+        "Standalone Silver execution detected. "
+        "Proceeding with existing transformation behavior."
+    )
+
+if processing_required:
+
+    # Initialize Spark
+    sc = SparkContext.getOrCreate()
+    
+    spark = (
+        SparkSession.builder
+        .enableHiveSupport()
+        .getOrCreate()
+    )
+    
+    # Read the Bronze provider information table
+    provider_df = spark.table(
+        f"{BRONZE_DATABASE}.provider_info_staging"
+    )
+    
+    print(f"Bronze provider records: {provider_df.count()}")
+    
+    # Clean and standardize facility information
+    dim_facility = provider_df.select(
+        F.trim(F.col("cms certification number (ccn)")).alias("facility_id"),
+        F.trim(F.col("provider name")).alias("facility_name"),
+        F.trim(F.col("provider address")).alias("address"),
+        F.trim(F.col("city/town")).alias("city"),
+        F.upper(F.trim(F.col("state"))).alias("state"),
+        F.trim(F.col("zip code")).alias("zip_code"),
+        F.trim(F.col("county/parish")).alias("county"),
+        F.trim(F.col("ownership type")).alias("ownership_type"),
+    
+        F.expr(
+            "try_cast(`number of certified beds` AS INT)"
+        ).alias("certified_beds"),
+    
+        F.expr(
+            "try_cast(`average number of residents per day` AS DOUBLE)"
+        ).alias("avg_daily_residents"),
+    
+        F.expr(
+            "try_cast(`overall rating` AS INT)"
+        ).alias("overall_rating"),
+    
+        F.expr(
+            "try_cast(`staffing rating` AS INT)"
+        ).alias("staffing_rating"),
+    
+        F.expr(
+            "try_cast(`latitude` AS DOUBLE)"
+        ).alias("latitude"),
+    
+        F.expr(
+            "try_cast(`longitude` AS DOUBLE)"
+        ).alias("longitude"),
+    
+        F.to_date(
+            F.col("processing date"),
+            "yyyy-MM-dd"
+        ).alias("processing_date")
+    )
+    
+    # Validate facility identifiers
+    invalid_ids = dim_facility.filter(
+        F.col("facility_id").isNull() |
+        (F.col("facility_id") == "")
+    ).count()
+    
+    if invalid_ids > 0:
+        raise RuntimeError(
+            f"Found {invalid_ids} facilities with missing IDs."
+        )
+    
+    # Validate uniqueness
+    total_records = dim_facility.count()
+    
+    unique_facilities = (
+        dim_facility.select("facility_id")
+        .distinct()
+        .count()
+    )
+    
+    if total_records != unique_facilities:
+        raise RuntimeError(
+            f"Duplicate facility IDs detected: "
+            f"{total_records - unique_facilities}"
+        )
+    
+    print(f"Validated facilities: {total_records}")
+    print("dim_facility schema:")
+    dim_facility.printSchema()
+    
+    # Validate transformed column values
+    dim_facility.select(
+        F.count("*").alias("total_facilities"),
+        F.count("certified_beds").alias("valid_bed_counts"),
+        F.count("avg_daily_residents").alias("valid_resident_counts"),
+        F.count("overall_rating").alias("valid_overall_ratings"),
+        F.count("staffing_rating").alias("valid_staffing_ratings"),
+        F.count("latitude").alias("valid_latitudes"),
+        F.count("longitude").alias("valid_longitudes"),
+        F.count("processing_date").alias("valid_processing_dates")
+    ).show(truncate=False)
+    
+    print("dim_facility transformation completed successfully.")
+    
+    
+    # ----------------------------------------
+    # Write dim_facility Silver snapshot
+    # ----------------------------------------
+    
+    s3 = boto3.client("s3", region_name="us-east-1")
+    
+    # Create a unique snapshot identifier
+    run_id = datetime.now(timezone.utc).strftime(
+        "%Y%m%dT%H%M%S%fZ"
+    )
+    
+    snapshot_prefix = (
+        f"{SILVER_PREFIX}/dim_facility/runs/{run_id}/"
+    )
+    
+    snapshot_path = (
+        f"s3://{BUCKET}/{snapshot_prefix}"
+    )
+    
+    # Require valid processing dates
+    invalid_dates = dim_facility.filter(
+        F.col("processing_date").isNull()
+    ).count()
+    
+    if invalid_dates > 0:
+        raise RuntimeError(
+            f"Found {invalid_dates} facilities "
+            "with invalid processing dates."
+        )
+    
+    # Prevent overwriting an existing snapshot
+    response = s3.list_objects_v2(
+        Bucket=BUCKET,
+        Prefix=snapshot_prefix,
+        MaxKeys=1
+    )
+    
+    if response.get("KeyCount", 0) > 0:
+        raise RuntimeError(
+            f"Snapshot already exists: {snapshot_path}"
+        )
+    
+    # Enable Spark success markers
+    spark.sparkContext._jsc.hadoopConfiguration().set(
+        "mapreduce.fileoutputcommitter.marksuccessfuljobs",
+        "true"
+    )
+    
+    # Write Parquet
+    dim_facility.write.mode(
+        "errorifexists"
+    ).parquet(snapshot_path)
+    
+    # Verify _SUCCESS exists
+    s3.head_object(
+        Bucket=BUCKET,
+        Key=f"{snapshot_prefix}_SUCCESS"
+    )
+    
+    # Verify Parquet data can be read
+    written_df = spark.read.parquet(snapshot_path)
+    
+    written_count = written_df.count()
+    
+    if written_count != total_records:
+        raise RuntimeError(
+            f"Row count mismatch: expected {total_records}, "
+            f"found {written_count}"
+        )
+    
+    # Verify the snapshot contains Parquet files
+    parquet_found = False
+    
+    paginator = s3.get_paginator("list_objects_v2")
+    
+    for page in paginator.paginate(
+        Bucket=BUCKET,
+        Prefix=snapshot_prefix
+    ):
+        for obj in page.get("Contents", []):
+            if (
+                obj["Key"].endswith(".parquet")
+                and obj["Size"] > 0
+            ):
+                parquet_found = True
+                break
+    
+        if parquet_found:
+            break
+    
+    if not parquet_found:
+        raise RuntimeError(
+            "No nonempty Parquet files found."
+        )
+    
+    print(f"Silver snapshot created: {snapshot_path}")
+    print(f"Validated row count: {written_count}")
+    print("_SUCCESS marker verified.")
+    
+    
+    # ----------------------------------------
+    # Register dim_facility in Glue Catalog
+    # ----------------------------------------
+    
+    glue = boto3.client("glue", region_name="us-east-1")
+    
+    table_name = "dim_facility"
+    
+    # Convert Spark schema to Glue-compatible columns
+    columns = [
+        {
+            "Name": field.name,
+            "Type": field.dataType.simpleString()
+        }
+        for field in written_df.schema.fields
+    ]
+    
+    table_input = {
+        "Name": table_name,
+        "TableType": "EXTERNAL_TABLE",
+        "Parameters": {
+            "classification": "parquet",
+            "EXTERNAL": "TRUE"
+        },
+        "StorageDescriptor": {
+            "Columns": columns,
+            "Location": snapshot_path,
+            "InputFormat": (
+                "org.apache.hadoop.hive.ql.io.parquet."
+                "MapredParquetInputFormat"
+            ),
+            "OutputFormat": (
+                "org.apache.hadoop.hive.ql.io.parquet."
+                "MapredParquetOutputFormat"
+            ),
+            "SerdeInfo": {
+                "SerializationLibrary": (
+                    "org.apache.hadoop.hive.ql.io.parquet.serde."
+                    "ParquetHiveSerDe"
+                ),
+                "Parameters": {
+                    "serialization.format": "1"
+                }
+            }
+        }
+    }
+    
+    # Create table if it doesn't exist;
+    # otherwise update its snapshot location
+    try:
+        glue.get_table(
+            DatabaseName=SILVER_DATABASE,
+            Name=table_name
+        )
+    
+        glue.update_table(
+            DatabaseName=SILVER_DATABASE,
+            TableInput=table_input
+        )
+    
+        print(f"Updated {SILVER_DATABASE}.{table_name}")
+    
+    except glue.exceptions.EntityNotFoundException:
+    
+        glue.create_table(
+            DatabaseName=SILVER_DATABASE,
+            TableInput=table_input
+        )
+    
+        print(f"Created {SILVER_DATABASE}.{table_name}")
+    
+    print(f"Published Silver snapshot: {snapshot_path}")
+    
+    
+    # ----------------------------------------
+    # Transform dim_date
+    # ----------------------------------------
+    
+    # Read Bronze daily staffing data
+    staffing_df = spark.table(
+        f"{BRONZE_DATABASE}.pbj_daily_staffing_staging"
+    )
+    
+    # Extract unique dates from staffing records
+    date_source = (
+        staffing_df
+        .select(
+            F.trim(F.col("workdate")).alias("workdate")
+        )
+        .distinct()
+    )
+    
+    # Convert yyyyMMdd strings into actual dates
+    date_source = date_source.withColumn(
+        "calendar_date",
+        F.to_date(F.col("workdate"), "yyyyMMdd")
+    )
+    
+    # Validate date conversions
+    invalid_dates = date_source.filter(
+        F.col("calendar_date").isNull()
+    ).count()
+    
+    if invalid_dates > 0:
+        raise RuntimeError(
+            f"Found {invalid_dates} invalid staffing dates."
+        )
+    
+    # Build the calendar dimension
+    dim_date = date_source.select(
+        F.date_format(
+            "calendar_date", "yyyyMMdd"
+        ).cast("int").alias("date_id"),
+    
+        F.col("calendar_date"),
+    
+        F.year("calendar_date").alias("year"),
+    
+        F.quarter("calendar_date").alias("quarter"),
+    
+        F.month("calendar_date").alias("month"),
+    
+        F.date_format(
+            "calendar_date", "MMMM"
+        ).alias("month_name"),
+    
+        F.dayofmonth(
+            "calendar_date"
+        ).alias("day_of_month"),
+    
+        # Monday = 1, Sunday = 7
+        (
+            (F.dayofweek("calendar_date") + 5) % 7 + 1
+        ).alias("day_of_week"),
+    
+        F.date_format(
+            "calendar_date", "EEEE"
+        ).alias("day_name"),
+    
+        F.dayofweek(
+            "calendar_date"
+        ).isin(1, 7).alias("is_weekend"),
+    
+        F.date_format(
+            "calendar_date", "yyyy-MM"
+        ).alias("year_month")
+    )
+    
+    # Validate row count and unique keys
+    total_dates = dim_date.count()
+    
+    unique_dates = (
+        dim_date.select("date_id")
+        .distinct()
+        .count()
+    )
+    
+    if total_dates != unique_dates:
+        raise RuntimeError(
+            "Duplicate date IDs detected."
+        )
+    
+    print(f"dim_date records: {total_dates}")
+    dim_date.orderBy("calendar_date").show(10, truncate=False)
+    
+    print("dim_date transformation completed successfully.")
+    
+    
+    # ----------------------------------------
+    # Write and publish dim_date
+    # ----------------------------------------
+    
+    date_run_id = datetime.now(timezone.utc).strftime(
+        "%Y%m%dT%H%M%S%fZ"
+    )
+    
+    date_snapshot_prefix = (
+        f"{SILVER_PREFIX}/dim_date/runs/{date_run_id}/"
+    )
+    
+    date_snapshot_path = (
+        f"s3://{BUCKET}/{date_snapshot_prefix}"
+    )
+    
+    # Write a new Parquet snapshot
+    dim_date.write.mode("errorifexists").parquet(
+        date_snapshot_path
+    )
+    
+    # Require a completed Spark write
+    s3.head_object(
+        Bucket=BUCKET,
+        Key=f"{date_snapshot_prefix}_SUCCESS"
+    )
+    
+    # Read back and verify row count
+    written_date_df = spark.read.parquet(
+        date_snapshot_path
+    )
+    
+    written_date_count = written_date_df.count()
+    
+    if written_date_count != total_dates:
+        raise RuntimeError(
+            f"dim_date row count mismatch: "
+            f"expected {total_dates}, "
+            f"found {written_date_count}"
+        )
+    
+    # Validate snapshot contains nonempty Parquet files
+    parquet_found = False
+    
+    for page in s3.get_paginator(
+        "list_objects_v2"
+    ).paginate(
+        Bucket=BUCKET,
+        Prefix=date_snapshot_prefix
+    ):
+        for obj in page.get("Contents", []):
+            if (
+                obj["Key"].endswith(".parquet")
+                and obj["Size"] > 0
+            ):
+                parquet_found = True
+                break
+    
+        if parquet_found:
+            break
+    
+    if not parquet_found:
+        raise RuntimeError(
+            "dim_date snapshot has no valid Parquet files."
+        )
+    
+    # Prepare Glue Catalog table definition
+    date_columns = [
+        {
+            "Name": field.name,
+            "Type": field.dataType.simpleString()
+        }
+        for field in written_date_df.schema.fields
+    ]
+    
+    date_table_input = {
+        "Name": "dim_date",
+        "TableType": "EXTERNAL_TABLE",
+        "Parameters": {
+            "classification": "parquet",
+            "EXTERNAL": "TRUE"
+        },
+        "StorageDescriptor": {
+            "Columns": date_columns,
+            "Location": date_snapshot_path,
+            "InputFormat": (
+                "org.apache.hadoop.hive.ql.io.parquet."
+                "MapredParquetInputFormat"
+            ),
+            "OutputFormat": (
+                "org.apache.hadoop.hive.ql.io.parquet."
+                "MapredParquetOutputFormat"
+            ),
+            "SerdeInfo": {
+                "SerializationLibrary": (
+                    "org.apache.hadoop.hive.ql.io.parquet.serde."
+                    "ParquetHiveSerDe"
+                ),
+                "Parameters": {
+                    "serialization.format": "1"
+                }
+            }
+        }
+    }
+    
+    # Create or update Glue Catalog table
+    try:
+        glue.get_table(
+            DatabaseName=SILVER_DATABASE,
+            Name="dim_date"
+        )
+    
+        glue.update_table(
+            DatabaseName=SILVER_DATABASE,
+            TableInput=date_table_input
+        )
+    
+        print("Updated healthcare_silver.dim_date")
+    
+    except glue.exceptions.EntityNotFoundException:
+        glue.create_table(
+            DatabaseName=SILVER_DATABASE,
+            TableInput=date_table_input
+        )
+    
+        print("Created healthcare_silver.dim_date")
+    
+    print(f"Published dim_date: {date_snapshot_path}")
+    print(f"Validated date records: {written_date_count}")
+    
+    
+    # ----------------------------------------
+    # Transform dim_state
+    # ----------------------------------------
+    
+    dim_state = (
+        dim_facility
+        .groupBy("state")
+        .agg(
+            F.count("*").alias("facility_count"),
+    
+            F.sum("certified_beds").cast("long").alias(
+                "total_certified_beds"
+            ),
+    
+            F.round(
+                F.avg("avg_daily_residents"), 2
+            ).alias("avg_facility_residents")
+        )
+        .withColumnRenamed("state", "state_code")
+    )
+    
+    # Validate state codes
+    invalid_states = dim_state.filter(
+        F.col("state_code").isNull() |
+        (F.trim(F.col("state_code")) == "") |
+        (~F.col("state_code").rlike("^[A-Z]{2}$"))
+    ).count()
+    
+    if invalid_states > 0:
+        raise RuntimeError(
+            f"Found {invalid_states} invalid state codes."
+        )
+    
+    # Validate uniqueness
+    total_states = dim_state.count()
+    
+    unique_states = (
+        dim_state.select("state_code")
+        .distinct()
+        .count()
+    )
+    
+    if total_states != unique_states:
+        raise RuntimeError(
+            "Duplicate state codes detected."
+        )
+    
+    # Verify every facility is represented
+    facilities_in_states = dim_state.agg(
+        F.sum("facility_count")
+    ).first()[0]
+    
+    if facilities_in_states != total_records:
+        raise RuntimeError(
+            f"Facility count mismatch: "
+            f"expected {total_records}, "
+            f"found {facilities_in_states}"
+        )
+    
+    print(f"dim_state records: {total_states}")
+    
+    dim_state.orderBy("state_code").show(
+        60, truncate=False
+    )
+    
+    print("dim_state transformation completed successfully.")
+    
+    
+    # ----------------------------------------
+    # Write and publish dim_state
+    # ----------------------------------------
+    
+    state_run_id = datetime.now(timezone.utc).strftime(
+        "%Y%m%dT%H%M%S%fZ"
+    )
+    
+    state_snapshot_prefix = (
+        f"{SILVER_PREFIX}/dim_state/runs/{state_run_id}/"
+    )
+    
+    state_snapshot_path = (
+        f"s3://{BUCKET}/{state_snapshot_prefix}"
+    )
+    
+    # Write Parquet snapshot
+    dim_state.write.mode("errorifexists").parquet(
+        state_snapshot_path
+    )
+    
+    # Verify successful Spark write
+    s3.head_object(
+        Bucket=BUCKET,
+        Key=f"{state_snapshot_prefix}_SUCCESS"
+    )
+    
+    # Read snapshot back
+    written_state_df = spark.read.parquet(
+        state_snapshot_path
+    )
+    
+    written_state_count = written_state_df.count()
+    
+    if written_state_count != total_states:
+        raise RuntimeError(
+            f"dim_state row count mismatch: "
+            f"expected {total_states}, "
+            f"found {written_state_count}"
+        )
+    
+    # Confirm at least one nonempty Parquet file exists
+    parquet_found = False
+    
+    for page in s3.get_paginator(
+        "list_objects_v2"
+    ).paginate(
+        Bucket=BUCKET,
+        Prefix=state_snapshot_prefix
+    ):
+        for obj in page.get("Contents", []):
+            if (
+                obj["Key"].endswith(".parquet")
+                and obj["Size"] > 0
+            ):
+                parquet_found = True
+                break
+    
+        if parquet_found:
+            break
+    
+    if not parquet_found:
+        raise RuntimeError(
+            "dim_state snapshot has no valid Parquet files."
+        )
+    
+    # Prepare Glue Catalog definition
+    state_columns = [
+        {
+            "Name": field.name,
+            "Type": field.dataType.simpleString()
+        }
+        for field in written_state_df.schema.fields
+    ]
+    
+    state_table_input = {
+        "Name": "dim_state",
+        "TableType": "EXTERNAL_TABLE",
+        "Parameters": {
+            "classification": "parquet",
+            "EXTERNAL": "TRUE"
+        },
+        "StorageDescriptor": {
+            "Columns": state_columns,
+            "Location": state_snapshot_path,
+            "InputFormat": (
+                "org.apache.hadoop.hive.ql.io.parquet."
+                "MapredParquetInputFormat"
+            ),
+            "OutputFormat": (
+                "org.apache.hadoop.hive.ql.io.parquet."
+                "MapredParquetOutputFormat"
+            ),
+            "SerdeInfo": {
+                "SerializationLibrary": (
+                    "org.apache.hadoop.hive.ql.io.parquet.serde."
+                    "ParquetHiveSerDe"
+                ),
+                "Parameters": {
+                    "serialization.format": "1"
+                }
+            }
+        }
+    }
+    
+    # Create or update Glue Catalog table
+    try:
+        glue.get_table(
+            DatabaseName=SILVER_DATABASE,
+            Name="dim_state"
+        )
+    
+        glue.update_table(
+            DatabaseName=SILVER_DATABASE,
+            TableInput=state_table_input
+        )
+    
+        print("Updated healthcare_silver.dim_state")
+    
+    except glue.exceptions.EntityNotFoundException:
+        glue.create_table(
+            DatabaseName=SILVER_DATABASE,
+            TableInput=state_table_input
+        )
+    
+        print("Created healthcare_silver.dim_state")
+    
+    print(f"Published dim_state: {state_snapshot_path}")
+    print(f"Validated state records: {written_state_count}")
+    
+    # ----------------------------------------
+    # Transform dim_collection_interval
+    # ----------------------------------------
+    
+    interval_source = spark.table(
+        f"{BRONZE_DATABASE}.data_collection_intervals_staging"
+    )
+    
+    dim_collection_interval = interval_source.select(
+        F.trim(F.col("measure code")).alias("measure_code"),
+    
+        F.trim(F.col("measure description")).alias(
+            "measure_description"
+        ),
+    
+        F.to_date(
+            F.col("data collection period from date"),
+            "MM/dd/yyyy"
+        ).alias("period_start_date"),
+    
+        F.to_date(
+            F.col("data collection period through date"),
+            "MM/dd/yyyy"
+        ).alias("period_end_date"),
+    
+        F.when(
+            F.trim(F.col("measure date range")) == "",
+            F.lit(None)
+        ).otherwise(
+            F.trim(F.col("measure date range"))
+        ).alias("measure_date_range"),
+    
+        F.to_date(
+            F.col("processing date"),
+            "yyyyMMdd"
+        ).alias("processing_date")
+    )
+    
+    # Generate a stable ID from measure code
+    dim_collection_interval = (
+        dim_collection_interval
+        .withColumn(
+            "interval_id",
+            F.sha2(F.col("measure_code"), 256)
+        )
+        .select(
+            "interval_id",
+            "measure_code",
+            "measure_description",
+            "period_start_date",
+            "period_end_date",
+            "measure_date_range",
+            "processing_date"
+        )
+    )
+    
+    # Validate required fields
+    invalid_records = dim_collection_interval.filter(
+        F.col("measure_code").isNull() |
+        (F.col("measure_code") == "") |
+        F.col("period_start_date").isNull() |
+        F.col("period_end_date").isNull() |
+        F.col("processing_date").isNull() |
+        (
+            F.col("period_start_date") >
+            F.col("period_end_date")
+        )
+    ).count()
+    
+    if invalid_records > 0:
+        raise RuntimeError(
+            f"Found {invalid_records} invalid collection intervals."
+        )
+    
+    # Validate uniqueness
+    total_intervals = dim_collection_interval.count()
+    
+    unique_measure_codes = (
+        dim_collection_interval
+        .select("measure_code")
+        .distinct()
+        .count()
+    )
+    
+    if total_intervals != unique_measure_codes:
+        raise RuntimeError(
+            "Duplicate measure codes detected."
+        )
+    
+    print(f"dim_collection_interval records: {total_intervals}")
+    
+    dim_collection_interval.orderBy("measure_code").show(
+        10, truncate=False
+    )
+    
+    print("dim_collection_interval transformation completed successfully.")
+    
+    # ----------------------------------------
+    # Write and publish dim_collection_interval
+    # ----------------------------------------
+    
+    interval_run_id = datetime.now(timezone.utc).strftime(
+        "%Y%m%dT%H%M%S%fZ"
+    )
+    
+    interval_snapshot_prefix = (
+        f"{SILVER_PREFIX}/dim_collection_interval/runs/{interval_run_id}/"
+    )
+    
+    interval_snapshot_path = (
+        f"s3://{BUCKET}/{interval_snapshot_prefix}"
+    )
+    
+    # Write Parquet snapshot
+    dim_collection_interval.write.mode(
+        "errorifexists"
+    ).parquet(interval_snapshot_path)
+    
+    # Verify _SUCCESS marker
+    s3.head_object(
+        Bucket=BUCKET,
+        Key=f"{interval_snapshot_prefix}_SUCCESS"
+    )
+    
+    # Read snapshot back
+    written_interval_df = spark.read.parquet(
+        interval_snapshot_path
+    )
+    
+    written_interval_count = written_interval_df.count()
+    
+    if written_interval_count != total_intervals:
+        raise RuntimeError(
+            f"dim_collection_interval row count mismatch: "
+            f"expected {total_intervals}, "
+            f"found {written_interval_count}"
+        )
+    
+    # Confirm nonempty Parquet files exist
+    parquet_found = False
+    
+    for page in s3.get_paginator(
+        "list_objects_v2"
+    ).paginate(
+        Bucket=BUCKET,
+        Prefix=interval_snapshot_prefix
+    ):
+        for obj in page.get("Contents", []):
+            if (
+                obj["Key"].endswith(".parquet")
+                and obj["Size"] > 0
+            ):
+                parquet_found = True
+                break
+    
+        if parquet_found:
+            break
+    
+    if not parquet_found:
+        raise RuntimeError(
+            "dim_collection_interval snapshot "
+            "contains no valid Parquet files."
+        )
+    
+    # Prepare Glue Catalog columns
+    interval_columns = [
+        {
+            "Name": field.name,
+            "Type": field.dataType.simpleString()
+        }
+        for field in written_interval_df.schema.fields
+    ]
+    
+    interval_table_input = {
+        "Name": "dim_collection_interval",
+        "TableType": "EXTERNAL_TABLE",
+        "Parameters": {
+            "classification": "parquet",
+            "EXTERNAL": "TRUE"
+        },
+        "StorageDescriptor": {
+            "Columns": interval_columns,
+            "Location": interval_snapshot_path,
+            "InputFormat": (
+                "org.apache.hadoop.hive.ql.io.parquet."
+                "MapredParquetInputFormat"
+            ),
+            "OutputFormat": (
+                "org.apache.hadoop.hive.ql.io.parquet."
+                "MapredParquetOutputFormat"
+            ),
+            "SerdeInfo": {
+                "SerializationLibrary": (
+                    "org.apache.hadoop.hive.ql.io.parquet.serde."
+                    "ParquetHiveSerDe"
+                ),
+                "Parameters": {
+                    "serialization.format": "1"
+                }
+            }
+        }
+    }
+    
+    # Create or update Glue Catalog table
+    try:
+        glue.get_table(
+            DatabaseName=SILVER_DATABASE,
+            Name="dim_collection_interval"
+        )
+    
+        glue.update_table(
+            DatabaseName=SILVER_DATABASE,
+            TableInput=interval_table_input
+        )
+    
+        print(
+            "Updated healthcare_silver.dim_collection_interval"
+        )
+    
+    except glue.exceptions.EntityNotFoundException:
+        glue.create_table(
+            DatabaseName=SILVER_DATABASE,
+            TableInput=interval_table_input
+        )
+    
+        print(
+            "Created healthcare_silver.dim_collection_interval"
+        )
+    
+    print(
+        f"Published dim_collection_interval: "
+        f"{interval_snapshot_path}"
+    )
+    
+    print(
+        f"Validated collection intervals: "
+        f"{written_interval_count}"
+    )
+    
+    # ----------------------------------------
+    # Transform fact_daily_staffing
+    # ----------------------------------------
+    
+    # Use the staffing DataFrame already loaded for dim_date.
+    # Keep the original Bronze data unchanged.
+    
+    # CMS staffing categories
+    STAFFING_ROLES = {
+        "rn_don": "hrs_rndon",
+        "rn_admin": "hrs_rnadmin",
+        "rn": "hrs_rn",
+        "lpn_admin": "hrs_lpnadmin",
+        "lpn": "hrs_lpn",
+        "cna": "hrs_cna",
+        "nurse_aide_training": "hrs_natrn",
+        "medication_aide": "hrs_medaide"
+    }
+    
+    # Required numeric source columns
+    numeric_columns = ["mdscensus"]
+    
+    for source_column in STAFFING_ROLES.values():
+        numeric_columns.extend([
+            source_column,
+            f"{source_column}_emp",
+            f"{source_column}_ctr"
+        ])
+    
+    # Convert source values to numeric types
+    fact_daily_staffing = staffing_df.select(
+        F.trim(F.col("provnum")).alias("facility_id"),
+    
+        F.to_date(
+            F.trim(F.col("workdate")),
+            "yyyyMMdd"
+        ).alias("work_date"),
+    
+        F.trim(F.col("cy_qtr")).alias("reporting_quarter"),
+    
+        F.col("source_file"),
+    
+        *[
+            F.expr(
+                f"try_cast(`{column}` AS DOUBLE)"
+            ).alias(column)
+            for column in numeric_columns
+        ]
+    )
+    
+    # Reject missing business keys and invalid numeric values
+    invalid_records = fact_daily_staffing.filter(
+        F.col("facility_id").isNull()
+        | (F.col("facility_id") == "")
+        | F.col("work_date").isNull()
+        | reduce(
+            lambda a, b: a | b,
+            [F.col(c).isNull() for c in numeric_columns]
+        )
+    ).count()
+    
+    if invalid_records > 0:
+        raise RuntimeError(
+            f"Found {invalid_records} records with "
+            "missing keys or invalid numeric values."
+        )
+    
+    # Reject negative staffing hours
+    hour_columns = [
+        c for c in numeric_columns
+        if c != "mdscensus"
+    ]
+    
+    negative_hours = fact_daily_staffing.filter(
+        reduce(
+            lambda a, b: a | b,
+            [F.col(c) < 0 for c in hour_columns]
+        )
+    ).count()
+    
+    if negative_hours > 0:
+        raise RuntimeError(
+            f"Found {negative_hours} records "
+            "with negative staffing hours."
+        )
+    
+    # Standardize census and date keys
+    fact_daily_staffing = (
+        fact_daily_staffing
+        .withColumnRenamed("mdscensus", "resident_census")
+        .withColumn(
+            "date_id",
+            F.date_format("work_date", "yyyyMMdd").cast("int")
+        )
+        .withColumn(
+            "is_valid_census",
+            F.col("resident_census") > 0
+        )
+    )
+    
+    # Create standardized hours for each staffing category
+    for role, source_column in STAFFING_ROLES.items():
+        fact_daily_staffing = (
+            fact_daily_staffing
+            .withColumnRenamed(
+                source_column, f"{role}_hours"
+            )
+            .withColumnRenamed(
+                f"{source_column}_emp",
+                f"{role}_employee_hours"
+            )
+            .withColumnRenamed(
+                f"{source_column}_ctr",
+                f"{role}_contract_hours"
+            )
+        )
+    
+    # Build aggregate nursing-hour totals
+    def sum_columns(column_names):
+        return reduce(
+            lambda a, b: a + b,
+            [F.col(c) for c in column_names]
+        )
+    
+    fact_daily_staffing = (
+        fact_daily_staffing
+        .withColumn(
+            "total_nursing_hours",
+            sum_columns([
+                f"{role}_hours"
+                for role in STAFFING_ROLES
+            ])
+        )
+        .withColumn(
+            "total_employee_hours",
+            sum_columns([
+                f"{role}_employee_hours"
+                for role in STAFFING_ROLES
+            ])
+        )
+        .withColumn(
+            "total_contract_hours",
+            sum_columns([
+                f"{role}_contract_hours"
+                for role in STAFFING_ROLES
+            ])
+        )
+    )
+    
+    # Calculate HPRD only when census is valid
+    fact_daily_staffing = (
+        fact_daily_staffing
+        .withColumn(
+            "total_hprd",
+            F.when(
+                F.col("is_valid_census"),
+                F.col("total_nursing_hours")
+                / F.col("resident_census")
+            ).otherwise(F.lit(None).cast("double"))
+        )
+        .withColumn(
+            "contract_labor_rate",
+            F.when(
+                F.col("total_nursing_hours") > 0,
+                F.col("total_contract_hours")
+                / F.col("total_nursing_hours")
+            ).otherwise(F.lit(None).cast("double"))
+        )
+    )
+    
+    
+    # ----------------------------------------
+    # Staffing data-quality indicators
+    # ----------------------------------------
+    
+    fact_daily_staffing = (
+        fact_daily_staffing
+        .withColumn(
+            "is_high_hprd",
+            F.coalesce(
+                F.col("total_hprd") > 10,
+                F.lit(False)
+            )
+        )
+        .withColumn(
+            "is_extreme_hprd",
+            F.coalesce(
+                F.col("total_hprd") > 20,
+                F.lit(False)
+            )
+        )
+        .withColumn(
+            "is_zero_staffing",
+            F.col("total_nursing_hours") == 0
+        )
+    )
+    
+    # Validate final row count and business keys
+    fact_count = fact_daily_staffing.count()
+    
+    unique_fact_keys = (
+        fact_daily_staffing
+        .select("facility_id", "date_id")
+        .distinct()
+        .count()
+    )
+    
+    if fact_count != unique_fact_keys:
+        raise RuntimeError(
+            "Duplicate facility/date combinations detected."
+        )
+    
+    source_count = staffing_df.count()
+    
+    if fact_count != source_count:
+        raise RuntimeError(
+            f"Row count mismatch: source={source_count}, "
+            f"fact={fact_count}"
+        )
+    
+    invalid_census_count = fact_daily_staffing.filter(
+        ~F.col("is_valid_census")
+    ).count()
+    
+    print(f"fact_daily_staffing records: {fact_count}")
+    print(f"Unique facility/date keys: {unique_fact_keys}")
+    print(f"Invalid census records: {invalid_census_count}")
+    
+    fact_daily_staffing.select(
+        "facility_id",
+        "work_date",
+        "resident_census",
+        "total_nursing_hours",
+        "total_employee_hours",
+        "total_contract_hours",
+        "total_hprd",
+        "contract_labor_rate"
+    ).show(10, truncate=False)
+    
+    
+    # ----------------------------------------
+    # Validate calculated staffing metrics
+    # ----------------------------------------
+    
+    metric_validation = fact_daily_staffing.agg(
+        F.count("*").alias("total_records"),
+    
+        F.sum(
+            F.when(
+                F.abs(
+                    F.col("total_nursing_hours") -
+                    (
+                        F.col("total_employee_hours") +
+                        F.col("total_contract_hours")
+                    )
+                ) > 0.01,
+                1
+            ).otherwise(0)
+        ).alias("nursing_hour_mismatches"),
+    
+        F.sum(
+            F.when(
+                F.col("contract_labor_rate").isNotNull() &
+                (
+                    (F.col("contract_labor_rate") < 0) |
+                    (F.col("contract_labor_rate") > 1)
+                ),
+                1
+            ).otherwise(0)
+        ).alias("invalid_contract_rates"),
+    
+        F.sum(
+            F.when(
+                ~F.col("is_valid_census") &
+                F.col("total_hprd").isNotNull(),
+                1
+            ).otherwise(0)
+        ).alias("invalid_census_with_hprd"),
+    
+        F.sum(
+            F.when(
+                F.col("is_valid_census") &
+                F.col("total_hprd").isNull(),
+                1
+            ).otherwise(0)
+        ).alias("valid_census_without_hprd"),
+    
+        F.min("total_hprd").alias("min_hprd"),
+        F.max("total_hprd").alias("max_hprd"),
+        F.avg("total_hprd").alias("avg_hprd")
+    )
+    
+    metric_validation.show(truncate=False)
+    
+    validation = metric_validation.first()
+    
+    for column in [
+        "nursing_hour_mismatches",
+        "invalid_contract_rates",
+        "invalid_census_with_hprd",
+        "valid_census_without_hprd"
+    ]:
+        if validation[column] != 0:
+            raise RuntimeError(
+                f"Staffing metric validation failed: "
+                f"{column}={validation[column]}"
+            )
+    
+    print("Staffing metric validation passed.")
+    
+    
+    # ----------------------------------------
+    # Investigate unusually high HPRD
+    # ----------------------------------------
+    
+    print("Top 20 highest HPRD records:")
+    
+    fact_daily_staffing.select(
+        "facility_id",
+        "work_date",
+        "resident_census",
+        "total_nursing_hours",
+        "total_employee_hours",
+        "total_contract_hours",
+        "total_hprd"
+    ).orderBy(
+        F.col("total_hprd").desc_nulls_last()
+    ).show(20, truncate=False)
+    
+    print("HPRD distribution:")
+    
+    fact_daily_staffing.agg(
+        F.sum(
+            F.when(F.col("total_hprd") > 10, 1).otherwise(0)
+        ).alias("hprd_over_10"),
+    
+        F.sum(
+            F.when(F.col("total_hprd") > 20, 1).otherwise(0)
+        ).alias("hprd_over_20"),
+    
+        F.sum(
+            F.when(F.col("total_hprd") > 50, 1).otherwise(0)
+        ).alias("hprd_over_50"),
+    
+        F.sum(
+            F.when(F.col("total_hprd") == 0, 1).otherwise(0)
+        ).alias("zero_hprd")
+    ).show(truncate=False)
+    
+    print("fact_daily_staffing transformation completed successfully.")
+    
+    # ----------------------------------------
+    # Publish fact_daily_staffing to Silver
+    # ----------------------------------------
+    
+    fact_table_name = "fact_daily_staffing"
+    fact_database = SILVER_DATABASE
+    
+    fact_run_id = datetime.now(
+        timezone.utc
+    ).strftime("%Y%m%dT%H%M%SZ")
+    
+    fact_s3_path = (
+        f"s3://{args['S3_BUCKET']}/"
+        f"{SILVER_PREFIX}/{fact_table_name}/runs/{fact_run_id}/"
+    )
+    
+    # Write Parquet snapshot
+    (
+        fact_daily_staffing
+        .write
+        .mode("errorifexists")
+        .parquet(fact_s3_path)
+    )
+    
+    # Validate the written snapshot
+    written_fact = spark.read.parquet(fact_s3_path)
+    
+    written_count = written_fact.count()
+    expected_count = fact_daily_staffing.count()
+    
+    if written_count != expected_count:
+        raise RuntimeError(
+            f"Fact snapshot row count mismatch: "
+            f"expected={expected_count}, actual={written_count}"
+        )
+    
+    # Verify at least one Parquet object exists
+    s3_client = boto3.client("s3")
+    
+    fact_prefix = (
+        f"{SILVER_PREFIX}/{fact_table_name}/runs/{fact_run_id}/"
+    )
+    
+    objects = s3_client.list_objects_v2(
+        Bucket=args["S3_BUCKET"],
+        Prefix=fact_prefix
+    )
+    
+    parquet_files = [
+        obj for obj in objects.get("Contents", [])
+        if obj["Key"].endswith(".parquet")
+        and obj["Size"] > 0
+    ]
+    
+    if not parquet_files:
+        raise RuntimeError(
+            "No nonempty Parquet files found in fact snapshot."
+        )
+    
+    # Verify Spark's successful-write marker
+    success_key = fact_prefix + "_SUCCESS"
+    
+    s3_client.head_object(
+        Bucket=args["S3_BUCKET"],
+        Key=success_key
+    )
+    
+    print(f"Fact snapshot validated: {fact_s3_path}")
+    print(f"Published row count: {written_count}")
+    
+    
+    # ----------------------------------------
+    # Register fact_daily_staffing
+    # in the Glue Data Catalog
+    # ----------------------------------------
+    
+    glue_client = boto3.client("glue")
+    
+    # Build the catalog schema from the written Parquet data
+    fact_columns = [
+        {
+            "Name": field.name,
+            "Type": field.dataType.simpleString()
+        }
+        for field in written_fact.schema.fields
+    ]
+    
+    fact_table_input = {
+        "Name": fact_table_name,
+        "TableType": "EXTERNAL_TABLE",
+        "Parameters": {
+            "classification": "parquet",
+            "EXTERNAL": "TRUE",
+            "parquet.compression": "snappy"
+        },
+        "StorageDescriptor": {
+            "Columns": fact_columns,
+            "Location": fact_s3_path,
+            "InputFormat": (
+                "org.apache.hadoop.hive.ql.io.parquet."
+                "MapredParquetInputFormat"
+            ),
+            "OutputFormat": (
+                "org.apache.hadoop.hive.ql.io.parquet."
+                "MapredParquetOutputFormat"
+            ),
+            "SerdeInfo": {
+                "SerializationLibrary": (
+                    "org.apache.hadoop.hive.ql.io.parquet.serde."
+                    "ParquetHiveSerDe"
+                )
+            }
+        }
+    }
+    
+    # Create the table or update its snapshot location
+    try:
+        glue_client.get_table(
+            DatabaseName=fact_database,
+            Name=fact_table_name
+        )
+    
+        glue_client.update_table(
+            DatabaseName=fact_database,
+            TableInput=fact_table_input
+        )
+    
+        print("Updated existing fact_daily_staffing catalog table.")
+    
+    except glue_client.exceptions.EntityNotFoundException:
+        glue_client.create_table(
+            DatabaseName=fact_database,
+            TableInput=fact_table_input
+        )
+    
+        print("Created fact_daily_staffing catalog table.")
+    
+    print(
+        f"Registered {fact_database}.{fact_table_name} "
+        f"at {fact_s3_path}"
+    )
+    
+    # ----------------------------------------
+    # Transform fact_quality_measures
+    # ----------------------------------------
+    
+    # Load Bronze quality measures
+    quality_df = spark.table(
+        "healthcare_bronze.quality_measures_mds_staging"
+    )
+    
+    # Convert source columns into Silver-friendly names
+    fact_quality_measures = quality_df.select(
+        F.trim(
+            F.col("`cms certification number (ccn)`")
+        ).alias("facility_id"),
+    
+        F.trim(
+            F.col("`measure code`")
+        ).alias("measure_code"),
+    
+        F.col("`resident type`").alias("resident_type"),
+        F.col("`measure period`").alias("measure_period"),
+    
+        F.expr(
+            "try_cast(`q1 measure score` AS DOUBLE)"
+        ).alias("q1_score"),
+    
+        F.expr(
+            "try_cast(`q2 measure score` AS DOUBLE)"
+        ).alias("q2_score"),
+    
+        F.expr(
+            "try_cast(`q3 measure score` AS DOUBLE)"
+        ).alias("q3_score"),
+    
+        F.expr(
+            "try_cast(`q4 measure score` AS DOUBLE)"
+        ).alias("q4_score"),
+    
+        F.expr(
+            "try_cast(`four quarter average score` AS DOUBLE)"
+        ).alias("four_quarter_avg_score"),
+    
+        F.col(
+            "`footnote for q1 measure score`"
+        ).alias("q1_footnote"),
+    
+        F.col(
+            "`footnote for q2 measure score`"
+        ).alias("q2_footnote"),
+    
+        F.col(
+            "`footnote for q3 measure score`"
+        ).alias("q3_footnote"),
+    
+        F.col(
+            "`footnote for q4 measure score`"
+        ).alias("q4_footnote"),
+    
+        F.col(
+            "`footnote for four quarter average score`"
+        ).alias("four_quarter_avg_footnote"),
+    
+        F.col(
+            "`used in quality measure five star rating`"
+        ).alias("used_in_five_star_rating"),
+    
+        F.to_date(
+            F.col("`processing date`"),
+            "yyyy-MM-dd"
+        ).alias("processing_date"),
+    
+        F.col("source_file")
+    )
+    
+    # ----------------------------------------
+    # Validate business keys
+    # ----------------------------------------
+    
+    total_records = fact_quality_measures.count()
+    
+    invalid_keys = fact_quality_measures.filter(
+        F.col("facility_id").isNull()
+        | (F.col("facility_id") == "")
+        | F.col("measure_code").isNull()
+        | (F.col("measure_code") == "")
+    ).count()
+    
+    if invalid_keys > 0:
+        raise RuntimeError(
+            f"Quality measures contain {invalid_keys} "
+            "records with invalid business keys."
+        )
+    
+    unique_keys = (
+        fact_quality_measures
+        .select("facility_id", "measure_code")
+        .distinct()
+        .count()
+    )
+    
+    if unique_keys != total_records:
+        raise RuntimeError(
+            "Duplicate facility/measure combinations detected."
+        )
+    
+    # ----------------------------------------
+    # Validate score conversions
+    # ----------------------------------------
+    
+    score_columns = [
+        "q1_score",
+        "q2_score",
+        "q3_score",
+        "q4_score",
+        "four_quarter_avg_score"
+    ]
+    
+    print("Quality-measure NULL score counts:")
+    
+    fact_quality_measures.select([
+        F.sum(
+            F.when(F.col(c).isNull(), 1).otherwise(0)
+        ).alias(c)
+        for c in score_columns
+    ]).show(truncate=False)
+    
+    print(f"Quality measure records: {total_records}")
+    print(f"Unique facility/measure keys: {unique_keys}")
+    
+    fact_quality_measures.show(5, truncate=False)
+    
+    print("fact_quality_measures transformation completed.")
+    
+    # ----------------------------------------
+    # Write fact_quality_measures to Silver
+    # ----------------------------------------
+    
+    quality_table_name = "fact_quality_measures"
+    
+    quality_run_id = datetime.now(
+        timezone.utc
+    ).strftime("%Y%m%dT%H%M%SZ")
+    
+    quality_s3_prefix = (
+        f"{SILVER_PREFIX}/{quality_table_name}/runs/{quality_run_id}/"
+    )
+    
+    quality_s3_path = (
+        f"s3://{args['S3_BUCKET']}/{quality_s3_prefix}"
+    )
+    
+    # Write Parquet snapshot
+    (
+        fact_quality_measures
+        .write
+        .mode("errorifexists")
+        .parquet(quality_s3_path)
+    )
+    
+    # Read the written snapshot back
+    written_quality = spark.read.parquet(quality_s3_path)
+    
+    expected_quality_count = total_records
+    written_quality_count = written_quality.count()
+    
+    if written_quality_count != expected_quality_count:
+        raise RuntimeError(
+            f"Quality fact row count mismatch: "
+            f"expected={expected_quality_count}, "
+            f"actual={written_quality_count}"
+        )
+    
+    # Verify successful Spark write
+    s3_client.head_object(
+        Bucket=args["S3_BUCKET"],
+        Key=quality_s3_prefix + "_SUCCESS"
+    )
+    
+    # Verify at least one nonempty Parquet file
+    paginator = s3_client.get_paginator("list_objects_v2")
+    
+    parquet_found = False
+    
+    for page in paginator.paginate(
+        Bucket=args["S3_BUCKET"],
+        Prefix=quality_s3_prefix
+    ):
+        for obj in page.get("Contents", []):
+            if (
+                obj["Key"].endswith(".parquet")
+                and obj["Size"] > 0
+            ):
+                parquet_found = True
+                break
+    
+        if parquet_found:
+            break
+    
+    if not parquet_found:
+        raise RuntimeError(
+            "No nonempty Parquet files found "
+            "in quality-measure snapshot."
+        )
+    
+    print(f"Quality snapshot validated: {quality_s3_path}")
+    print(f"Published quality records: {written_quality_count}")
+    
+    # ----------------------------------------
+    # Register fact_quality_measures
+    # in the Glue Data Catalog
+    # ----------------------------------------
+    
+    quality_database = SILVER_DATABASE
+    
+    # Build Glue-compatible schema from Parquet
+    quality_columns = [
+        {
+            "Name": field.name,
+            "Type": field.dataType.simpleString()
+        }
+        for field in written_quality.schema.fields
+    ]
+    
+    quality_table_input = {
+        "Name": quality_table_name,
+        "TableType": "EXTERNAL_TABLE",
+        "Parameters": {
+            "classification": "parquet",
+            "EXTERNAL": "TRUE",
+            "parquet.compression": "snappy"
+        },
+        "StorageDescriptor": {
+            "Columns": quality_columns,
+            "Location": quality_s3_path,
+            "InputFormat": (
+                "org.apache.hadoop.hive.ql.io.parquet."
+                "MapredParquetInputFormat"
+            ),
+            "OutputFormat": (
+                "org.apache.hadoop.hive.ql.io.parquet."
+                "MapredParquetOutputFormat"
+            ),
+            "SerdeInfo": {
+                "SerializationLibrary": (
+                    "org.apache.hadoop.hive.ql.io.parquet.serde."
+                    "ParquetHiveSerDe"
+                )
+            }
+        }
+    }
+    
+    # Create or update catalog table
+    try:
+        glue_client.get_table(
+            DatabaseName=quality_database,
+            Name=quality_table_name
+        )
+    
+        glue_client.update_table(
+            DatabaseName=quality_database,
+            TableInput=quality_table_input
+        )
+    
+        print("Updated existing fact_quality_measures table.")
+    
+    except glue_client.exceptions.EntityNotFoundException:
+        glue_client.create_table(
+            DatabaseName=quality_database,
+            TableInput=quality_table_input
+        )
+    
+        print("Created fact_quality_measures table.")
+    
+    print(
+        f"Registered {quality_database}.{quality_table_name} "
+        f"at {quality_s3_path}"
+    )
+    
+    # ----------------------------------------
+    # Transform fact_state_benchmarks
+    # ----------------------------------------
+    
+    benchmark_df = spark.table(
+        "healthcare_bronze.state_us_averages_staging"
+    )
+    
+    # Map Bronze columns to standardized Silver columns
+    BENCHMARK_COLUMNS = {
+        "nurse_aide_hprd":
+            "reported nurse aide staffing hours per resident per day",
+    
+        "lpn_hprd":
+            "reported lpn staffing hours per resident per day",
+    
+        "rn_hprd":
+            "reported rn staffing hours per resident per day",
+    
+        "licensed_hprd":
+            "reported licensed staffing hours per resident per day",
+    
+        "total_hprd":
+            "reported total nurse staffing hours per resident per day",
+    
+        "weekend_total_hprd":
+            "total number of nurse staff hours per resident per day on the weekend",
+    
+        "weekend_rn_hprd":
+            "registered nurse hours per resident per day on the weekend"
+    }
+    
+    fact_state_benchmarks = benchmark_df.select(
+        F.upper(
+            F.trim(F.col("`state or nation`"))
+        ).alias("geography_code"),
+    
+        F.when(
+            F.upper(F.trim(F.col("`state or nation`"))) == "NATION",
+            F.lit("NATIONAL")
+        ).otherwise(F.lit("STATE")).alias("geography_type"),
+    
+        F.to_date(
+            F.col("`processing date`"),
+            "yyyy-MM-dd"
+        ).alias("processing_date"),
+    
+        *[
+            F.expr(
+                f"try_cast(`{source_column}` AS DOUBLE)"
+            ).alias(target_column)
+            for target_column, source_column
+            in BENCHMARK_COLUMNS.items()
+        ],
+    
+        F.col("source_file")
+    )
+    
+    # ----------------------------------------
+    # Validate geographic business keys
+    # ----------------------------------------
+    
+    total_benchmark_records = fact_state_benchmarks.count()
+    
+    invalid_geographies = fact_state_benchmarks.filter(
+        F.col("geography_code").isNull()
+        | (F.col("geography_code") == "")
+        | F.col("processing_date").isNull()
+    ).count()
+    
+    if invalid_geographies > 0:
+        raise RuntimeError(
+            f"Found {invalid_geographies} invalid benchmark keys."
+        )
+    
+    unique_benchmark_keys = (
+        fact_state_benchmarks
+        .select("geography_code", "processing_date")
+        .distinct()
+        .count()
+    )
+    
+    if unique_benchmark_keys != total_benchmark_records:
+        raise RuntimeError(
+            "Duplicate geography/date benchmark keys detected."
+        )
+    
+    # ----------------------------------------
+    # Validate state and national records
+    # ----------------------------------------
+    
+    fact_state_benchmarks.groupBy(
+        "geography_type"
+    ).count().show()
+    
+    # ----------------------------------------
+    # Validate missing benchmark values
+    # ----------------------------------------
+    
+    fact_state_benchmarks.select([
+        F.sum(
+            F.when(
+                F.col(column).isNull(), 1
+            ).otherwise(0)
+        ).alias(column)
+        for column in BENCHMARK_COLUMNS
+    ]).show(truncate=False)
+    
+    print(
+        f"Benchmark records: {total_benchmark_records}"
+    )
+    print(
+        f"Unique geography/date keys: {unique_benchmark_keys}"
+    )
+    
+    print("fact_state_benchmarks transformation completed.")
+    
+    # ----------------------------------------
+    # Write fact_state_benchmarks to Silver
+    # ----------------------------------------
+    
+    benchmark_table_name = "fact_state_benchmarks"
+    
+    benchmark_run_id = datetime.now(
+        timezone.utc
+    ).strftime("%Y%m%dT%H%M%SZ")
+    
+    benchmark_s3_prefix = (
+        f"{SILVER_PREFIX}/{benchmark_table_name}/runs/{benchmark_run_id}/"
+    )
+    
+    benchmark_s3_path = (
+        f"s3://{args['S3_BUCKET']}/{benchmark_s3_prefix}"
+    )
+    
+    # Write Parquet snapshot
+    (
+        fact_state_benchmarks
+        .write
+        .mode("errorifexists")
+        .parquet(benchmark_s3_path)
+    )
+    
+    # Read the snapshot back for validation
+    written_benchmarks = spark.read.parquet(
+        benchmark_s3_path
+    )
+    
+    written_benchmark_count = written_benchmarks.count()
+    
+    if written_benchmark_count != total_benchmark_records:
+        raise RuntimeError(
+            f"Benchmark row count mismatch: "
+            f"expected={total_benchmark_records}, "
+            f"actual={written_benchmark_count}"
+        )
+    
+    # Verify Spark's successful-write marker
+    s3_client.head_object(
+        Bucket=args["S3_BUCKET"],
+        Key=benchmark_s3_prefix + "_SUCCESS"
+    )
+    
+    # Verify at least one nonempty Parquet file
+    paginator = s3_client.get_paginator("list_objects_v2")
+    
+    parquet_found = False
+    
+    for page in paginator.paginate(
+        Bucket=args["S3_BUCKET"],
+        Prefix=benchmark_s3_prefix
+    ):
+        for obj in page.get("Contents", []):
+            if (
+                obj["Key"].endswith(".parquet")
+                and obj["Size"] > 0
+            ):
+                parquet_found = True
+                break
+    
+        if parquet_found:
+            break
+    
+    if not parquet_found:
+        raise RuntimeError(
+            "No nonempty Parquet files found "
+            "in benchmark snapshot."
+        )
+    
+    print(
+        f"Benchmark snapshot validated: {benchmark_s3_path}"
+    )
+    print(
+        f"Published benchmark records: {written_benchmark_count}"
+    )
+    
+    # ----------------------------------------
+    # Register fact_state_benchmarks
+    # in the Glue Data Catalog
+    # ----------------------------------------
+    
+    benchmark_database = SILVER_DATABASE
+    
+    # Build catalog schema from validated Parquet data
+    benchmark_columns = [
+        {
+            "Name": field.name,
+            "Type": field.dataType.simpleString()
+        }
+        for field in written_benchmarks.schema.fields
+    ]
+    
+    benchmark_table_input = {
+        "Name": benchmark_table_name,
+        "TableType": "EXTERNAL_TABLE",
+        "Parameters": {
+            "classification": "parquet",
+            "EXTERNAL": "TRUE",
+            "parquet.compression": "snappy"
+        },
+        "StorageDescriptor": {
+            "Columns": benchmark_columns,
+            "Location": benchmark_s3_path,
+            "InputFormat": (
+                "org.apache.hadoop.hive.ql.io.parquet."
+                "MapredParquetInputFormat"
+            ),
+            "OutputFormat": (
+                "org.apache.hadoop.hive.ql.io.parquet."
+                "MapredParquetOutputFormat"
+            ),
+            "SerdeInfo": {
+                "SerializationLibrary": (
+                    "org.apache.hadoop.hive.ql.io.parquet.serde."
+                    "ParquetHiveSerDe"
+                )
+            }
+        }
+    }
+    
+    # Create or update the catalog table
+    try:
+        glue_client.get_table(
+            DatabaseName=benchmark_database,
+            Name=benchmark_table_name
+        )
+    
+        glue_client.update_table(
+            DatabaseName=benchmark_database,
+            TableInput=benchmark_table_input
+        )
+    
+        print("Updated existing fact_state_benchmarks table.")
+    
+    except glue_client.exceptions.EntityNotFoundException:
+        glue_client.create_table(
+            DatabaseName=benchmark_database,
+            TableInput=benchmark_table_input
+        )
+    
+        print("Created fact_state_benchmarks table.")
+    
+    print(
+        f"Registered {benchmark_database}.{benchmark_table_name} "
+        f"at {benchmark_s3_path}"
+    )
+
+else:
+    print("Silver completed successfully without processing.")
