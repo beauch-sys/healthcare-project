@@ -1,0 +1,399 @@
+
+import os
+import sys
+import json
+import fnmatch
+import tempfile
+from datetime import datetime, timezone
+
+import boto3
+from botocore.exceptions import ClientError
+from awsglue.utils import getResolvedOptions
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload
+
+
+# --------------------------------------------------
+# Job parameters
+# --------------------------------------------------
+
+
+args = getResolvedOptions(
+    sys.argv,
+    [
+        "GOOGLE_DRIVE_FOLDER_ID",
+        "S3_BUCKET",
+        "SECRET_NAME"
+    ]
+)
+
+# Workflow context is available when the job
+# is launched as part of an AWS Glue Workflow.
+workflow_args = {}
+
+if (
+    "--WORKFLOW_NAME" in sys.argv
+    and "--WORKFLOW_RUN_ID" in sys.argv
+):
+    workflow_args = getResolvedOptions(
+        sys.argv,
+        ["WORKFLOW_NAME", "WORKFLOW_RUN_ID"]
+    )
+
+    print(
+        f"Workflow: {workflow_args['WORKFLOW_NAME']}, "
+        f"Run: {workflow_args['WORKFLOW_RUN_ID']}"
+    )
+    
+FOLDER_ID = args["GOOGLE_DRIVE_FOLDER_ID"]
+BUCKET = args["S3_BUCKET"]
+SECRET_NAME = args["SECRET_NAME"]
+
+REGION = "us-east-1"
+
+DATASETS = {
+    "pbj_daily_staffing": "PBJ_Daily_Nurse_Staffing_*.csv",
+    "data_collection_intervals": "NH_DataCollectionIntervals_*.csv",
+    "provider_info": "NH_ProviderInfo_*.csv",
+    "quality_measures_mds": "NH_QualityMsr_MDS_*.csv",
+    "state_us_averages": "NH_StateUSAverages_*.csv"
+}
+
+s3 = boto3.client("s3", region_name=REGION)
+secrets = boto3.client("secretsmanager", region_name=REGION)
+
+# --------------------------------------------------
+# Authenticate to Google Drive
+# --------------------------------------------------
+
+secret_response = secrets.get_secret_value(
+    SecretId=SECRET_NAME
+)
+
+credentials_json = json.loads(
+    secret_response["SecretString"]
+)
+
+credentials = service_account.Credentials.from_service_account_info(
+    credentials_json,
+    scopes=["https://www.googleapis.com/auth/drive.readonly"]
+)
+
+drive = build(
+    "drive",
+    "v3",
+    credentials=credentials,
+    cache_discovery=False
+)
+
+print("Google Drive authentication initialized.")
+
+# --------------------------------------------------
+# List files in the selected folder
+# --------------------------------------------------
+
+def list_drive_files(folder_id):
+    files = []
+    page_token = None
+
+    while True:
+        response = drive.files().list(
+            q=f"'{folder_id}' in parents and trashed = false",
+            fields=(
+                "nextPageToken,"
+                "files(id,name,mimeType,modifiedTime,size)"
+            ),
+            pageSize=1000,
+            pageToken=page_token,
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True
+        ).execute()
+
+        files.extend(response.get("files", []))
+        page_token = response.get("nextPageToken")
+
+        if not page_token:
+            break
+
+    return files
+
+
+files = list_drive_files(FOLDER_ID)
+
+print(f"Found {len(files)} items in the Google Drive folder.")
+
+
+
+# --------------------------------------------------
+# Select the most recently modified file
+# for each of the five CMS datasets
+# --------------------------------------------------
+
+selected_files = {}
+
+for dataset, pattern in DATASETS.items():
+
+    matches = [
+        file
+        for file in files
+        if file.get("mimeType") == "text/csv"
+        or (
+            file.get("mimeType") !=
+            "application/vnd.google-apps.folder"
+            and file["name"].lower().endswith(".csv")
+        )
+    ]
+
+    matches = [
+        file
+        for file in matches
+        if fnmatch.fnmatchcase(
+            file["name"].lower(),
+            pattern.lower()
+        )
+    ]
+
+    if not matches:
+        raise RuntimeError(
+            f"No matching file found for {dataset}: {pattern}"
+        )
+
+    latest_file = max(
+        matches,
+        key=lambda f: (
+            f.get("modifiedTime", ""),
+            f["id"]
+        )
+    )
+
+    selected_files[dataset] = latest_file
+
+    print(
+        f"Selected {dataset}: "
+        f"{latest_file['name']} "
+        f"(modified: {latest_file.get('modifiedTime')})"
+    )
+
+print("All five latest CMS files selected successfully.")
+
+
+# --------------------------------------------------
+# Detect changes against last successful pipeline run
+# --------------------------------------------------
+
+state_key = "temp/pipeline-state/source-state.json"
+
+try:
+    response = s3.get_object(
+        Bucket=BUCKET,
+        Key=state_key
+    )
+
+    previous_state = json.loads(
+        response["Body"].read().decode("utf-8")
+    )
+
+    print("Previous successful pipeline state loaded.")
+
+except ClientError as e:
+    if e.response["Error"]["Code"] in ("NoSuchKey", "404"):
+        previous_state = {"datasets": {}}
+        print("No previous pipeline state found. Initial run.")
+    else:
+        raise
+    
+previous_datasets = previous_state.get("datasets", {})
+
+changed_datasets = {}
+
+for dataset, file in selected_files.items():
+
+    current_version = {
+        "google_drive_file_id": file["id"],
+        "google_drive_modified_time": file.get("modifiedTime"),
+        "google_drive_size": file.get("size")
+    }
+
+    previous_version = previous_datasets.get(dataset)
+
+    if current_version != previous_version:
+        changed_datasets[dataset] = current_version
+        print(f"CHANGED: {dataset}")
+    else:
+        print(f"UNCHANGED: {dataset}")
+
+print(
+    f"Source-change detection complete: "
+    f"{len(changed_datasets)} of "
+    f"{len(selected_files)} datasets changed."
+)
+
+
+# --------------------------------------------------
+# Download each file to temporary storage
+# and upload to a staging prefix in S3
+# --------------------------------------------------
+
+run_id = datetime.now(timezone.utc).strftime(
+    "%Y%m%dT%H%M%SZ"
+)
+
+staging_prefix = f"temp/drive-ingestion/{run_id}/"
+
+
+# --------------------------------------------------
+# Download only changed Google Drive files
+# --------------------------------------------------
+
+for dataset, file in selected_files.items():
+
+    if dataset not in changed_datasets:
+        print(
+            f"SKIPPED DOWNLOAD: {dataset} "
+            f"(source unchanged)"
+        )
+        continue
+
+    file_id = file["id"]
+    filename = file["name"]
+
+    print(f"Downloading {filename}...")
+
+    request = drive.files().get_media(
+        fileId=file_id,
+        supportsAllDrives=True
+    )
+
+    with tempfile.TemporaryFile() as temporary_file:
+
+        downloader = MediaIoBaseDownload(
+            temporary_file,
+            request,
+            chunksize=1024 * 1024
+        )
+
+        done = False
+
+        while not done:
+            status, done = downloader.next_chunk()
+
+            if status:
+                print(
+                    f"{filename}: {int(status.progress() * 100)}%"
+                )
+
+        temporary_file.seek(0)
+
+        key = f"{staging_prefix}{dataset}/{filename}"
+
+        s3.upload_fileobj(
+            temporary_file,
+            BUCKET,
+            key
+        )
+
+        print(f"Uploaded staging file: s3://{BUCKET}/{key}")
+
+
+# --------------------------------------------------
+# Publish only changed files to active S3 locations
+# --------------------------------------------------
+
+for dataset, file in selected_files.items():
+
+    if dataset not in changed_datasets:
+        print(
+            f"SKIPPED PUBLISH: {dataset} "
+            f"(source unchanged)"
+        )
+        continue
+
+    filename = file["name"]
+
+    source_key = (
+        f"{staging_prefix}{dataset}/{filename}"
+    )
+
+    destination_key = (
+        f"data/{dataset}/{filename}"
+    )
+
+    s3.copy_object(
+        Bucket=BUCKET,
+        CopySource={
+            "Bucket": BUCKET,
+            "Key": source_key
+        },
+        Key=destination_key
+    )
+
+    print(f"Published: s3://{BUCKET}/{destination_key}")
+
+# --------------------------------------------------
+# Write manifest for downstream Glue jobs
+# --------------------------------------------------
+
+manifest = {
+    "run_id": run_id,
+    "status": "complete",
+    "datasets": {
+        dataset: {
+            "filename": file["name"],
+            "google_drive_file_id": file["id"],
+            "google_drive_modified_time": file.get("modifiedTime"),
+            "google_drive_size": file.get("size"),
+            "s3_key": f"data/{dataset}/{file['name']}",
+            "staging_s3_key": (
+                f"{staging_prefix}{dataset}/{file['name']}"
+                if dataset in changed_datasets
+                else None
+            ),
+            "changed": dataset in changed_datasets
+        }
+        for dataset, file in selected_files.items()
+    }
+}
+
+manifest_key = f"{staging_prefix}manifest.json"
+
+s3.put_object(
+    Bucket=BUCKET,
+    Key=manifest_key,
+    Body=json.dumps(manifest, indent=2).encode("utf-8"),
+    ContentType="application/json"
+)
+
+print(f"Manifest written: s3://{BUCKET}/{manifest_key}")
+
+
+# --------------------------------------------------
+# Share ingestion manifest with the current workflow
+# --------------------------------------------------
+
+if workflow_args:
+
+    glue_client = boto3.client(
+        "glue",
+        region_name="us-east-1"
+    )
+
+    glue_client.put_workflow_run_properties(
+        Name=workflow_args["WORKFLOW_NAME"],
+        RunId=workflow_args["WORKFLOW_RUN_ID"],
+        RunProperties={
+            "INGESTION_RUN_ID": run_id,
+            "MANIFEST_KEY": manifest_key,
+            "SOURCE_CHANGES_DETECTED": str(
+                bool(changed_datasets)
+            ).lower()
+        }
+    )
+
+    print(
+        "Workflow properties updated: "
+        f"manifest={manifest_key}, "
+        f"changes={bool(changed_datasets)}"
+    )
+
+print("Google Drive ingestion completed successfully.")
