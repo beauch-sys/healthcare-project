@@ -1,0 +1,2194 @@
+
+# ==========================================
+# Healthcare Gold Transformations
+# ==========================================
+
+import sys
+import json
+import boto3
+
+from datetime import datetime, timezone
+from awsglue.utils import getResolvedOptions
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from pyspark.context import SparkContext
+from pyspark.sql import functions as F
+
+# ------------------------------------------
+# Initialize Glue and Spark
+# ------------------------------------------
+
+args = getResolvedOptions(
+    sys.argv,
+    [
+        "JOB_NAME",
+        "S3_BUCKET",
+        "SILVER_DATABASE",
+        "GOLD_DATABASE",
+        "GOLD_PREFIX"
+    ]
+)
+
+S3_BUCKET = args["S3_BUCKET"]
+SILVER_DATABASE = args["SILVER_DATABASE"]
+GOLD_DATABASE = args["GOLD_DATABASE"]
+GOLD_PREFIX = args["GOLD_PREFIX"]
+
+
+# ----------------------------------------
+# Enforce production/test isolation
+# ----------------------------------------
+
+if SILVER_DATABASE == "healthcare_silver_test":
+
+    if GOLD_DATABASE != "healthcare_gold_test":
+        raise RuntimeError(
+            "Test Silver requires the test Gold database."
+        )
+
+    if GOLD_PREFIX != "gold-test":
+        raise RuntimeError(
+            "Test Silver requires GOLD_PREFIX=gold-test."
+        )
+
+elif SILVER_DATABASE == "healthcare_silver":
+
+    if GOLD_DATABASE != "healthcare_gold":
+        raise RuntimeError(
+            "Production Silver requires the production Gold database."
+        )
+
+    if GOLD_PREFIX != "gold":
+        raise RuntimeError(
+            "Production Silver requires GOLD_PREFIX=gold."
+        )
+
+else:
+    raise RuntimeError(
+        f"Unexpected Silver database: {SILVER_DATABASE}"
+    )
+
+
+# ----------------------------------------
+# Skip Gold when Bronze found no changes
+# ----------------------------------------
+
+processing_required = True
+
+if "--WORKFLOW_NAME" in sys.argv and "--WORKFLOW_RUN_ID" in sys.argv:
+
+    workflow_args = getResolvedOptions(
+        sys.argv,
+        ["WORKFLOW_NAME", "WORKFLOW_RUN_ID"]
+    )
+
+    glue_client = boto3.client("glue", region_name="us-east-1")
+    s3_client = boto3.client("s3", region_name="us-east-1")
+
+    workflow_properties = glue_client.get_workflow_run_properties(
+        Name=workflow_args["WORKFLOW_NAME"],
+        RunId=workflow_args["WORKFLOW_RUN_ID"]
+    )["RunProperties"]
+
+    ingestion_run_id = workflow_properties.get("INGESTION_RUN_ID")
+
+    if not ingestion_run_id:
+        raise RuntimeError(
+            "Workflow is missing INGESTION_RUN_ID."
+        )
+
+    status_key = (
+        f"temp/pipeline-status/"
+        f"{ingestion_run_id}/bronze-status.json"
+    )
+
+    status_object = s3_client.get_object(
+        Bucket=S3_BUCKET,
+        Key=status_key
+    )
+
+    bronze_status = json.loads(
+        status_object["Body"].read().decode("utf-8")
+    )
+
+    if bronze_status.get("run_id") != ingestion_run_id:
+        raise RuntimeError(
+            "Bronze status run ID does not match this workflow."
+        )
+
+    if bronze_status.get("status") != "success":
+        raise RuntimeError(
+            "Bronze did not report successful completion."
+        )
+
+    changes_detected = bronze_status.get("changes_detected")
+
+    if not isinstance(changes_detected, bool):
+        raise RuntimeError(
+            "Bronze status has an invalid changes_detected value."
+        )
+
+    if bronze_status.get("bronze_processed") is not changes_detected:
+        raise RuntimeError(
+            "Bronze processing status is inconsistent."
+        )
+
+    processing_required = changes_detected
+    
+    if processing_required:
+        print(
+            "Bronze changes detected. "
+            "Proceeding with Gold transformations."
+        )
+    else:
+        print(
+            "No Bronze changes detected. "
+            "Skipping all Gold transformations."
+        )
+
+else:
+    print(
+        "Standalone Gold execution detected. "
+        "Proceeding with existing transformation behavior."
+    )
+
+if processing_required:
+
+    # ----------------------------------------
+    # Initialize Glue and Spark
+    # ----------------------------------------
+    
+    sc = SparkContext.getOrCreate()
+    glue_context = GlueContext(sc)
+    spark = glue_context.spark_session
+    
+    job = Job(glue_context)
+    job.init(args["JOB_NAME"], args)
+    
+    print("Starting Healthcare Gold transformations")
+    
+    
+    # ------------------------------------------
+    # Load Silver source tables
+    # ------------------------------------------
+    
+    staffing_df = spark.table(
+        f"{SILVER_DATABASE}.fact_daily_staffing"
+    )
+    
+    facility_df = spark.table(
+        f"{SILVER_DATABASE}.dim_facility"
+    )
+    
+    date_df = spark.table(
+        f"{SILVER_DATABASE}.dim_date"
+    )
+    
+    benchmark_df = spark.table(
+        f"{SILVER_DATABASE}.fact_state_benchmarks"
+    )
+    
+    # ------------------------------------------
+    # Verify source tables
+    # ------------------------------------------
+    
+    source_tables = {
+        "fact_daily_staffing": staffing_df,
+        "dim_facility": facility_df,
+        "dim_date": date_df,
+        "fact_state_benchmarks": benchmark_df
+    }
+    
+    for table_name, dataframe in source_tables.items():
+        record_count = dataframe.count()
+    
+        print(
+            f"Loaded {SILVER_DATABASE}.{table_name}: "
+            f"{record_count} records"
+        )
+    
+    print("All required Silver source tables loaded.")
+    
+    
+    # ==========================================
+    # GOLD METRIC 1: Nursing HPRD
+    # ==========================================
+    
+    # ------------------------------------------
+    # Step 1: Prepare staffing and date data
+    # ------------------------------------------
+    
+    staffing_dates_df = (
+        staffing_df.alias("s")
+        .join(
+            date_df.alias("d"),
+            F.col("s.date_id") == F.col("d.date_id"),
+            "left"
+        )
+        .select(
+            F.col("s.facility_id"),
+            F.col("s.date_id"),
+            F.col("d.year"),
+            F.col("d.quarter"),
+            F.col("s.resident_census"),
+            F.col("s.total_nursing_hours"),
+            F.col("s.total_employee_hours"),
+            F.col("s.total_contract_hours"),
+            F.col("s.is_valid_census"),
+            F.col("s.is_high_hprd"),
+            F.col("s.is_extreme_hprd")
+        )
+    )
+    
+    # ------------------------------------------
+    # Step 2: Aggregate by facility and quarter
+    # ------------------------------------------
+    
+    facility_hprd_df = (
+        staffing_dates_df
+        .groupBy(
+            "facility_id",
+            "year",
+            "quarter"
+        )
+        .agg(
+            F.count("*").alias("total_staffing_days"),
+    
+            F.sum(
+                F.when(
+                    F.col("resident_census") > 0,
+                    1
+                ).otherwise(0)
+            ).alias("valid_census_days"),
+    
+            F.sum(
+                F.when(
+                    F.col("resident_census").isNull()
+                    | (F.col("resident_census") <= 0),
+                    1
+                ).otherwise(0)
+            ).alias("excluded_census_days"),
+    
+            F.sum("resident_census")
+                .alias("total_reported_resident_census"),
+    
+            F.sum("total_nursing_hours")
+                .alias("total_reported_nursing_hours"),
+    
+            F.sum(
+                F.when(
+                    F.col("resident_census") > 0,
+                    F.col("resident_census")
+                ).otherwise(0)
+            ).alias("eligible_resident_days"),
+    
+            F.sum(
+                F.when(
+                    F.col("resident_census") > 0,
+                    F.col("total_nursing_hours")
+                ).otherwise(0)
+            ).alias("eligible_nursing_hours"),
+    
+            F.sum(
+                F.when(
+                    F.col("resident_census") > 0,
+                    F.col("total_employee_hours")
+                ).otherwise(0)
+            ).alias("eligible_employee_hours"),
+    
+            F.sum(
+                F.when(
+                    F.col("resident_census") > 0,
+                    F.col("total_contract_hours")
+                ).otherwise(0)
+            ).alias("eligible_contract_hours"),
+    
+            F.sum(
+                F.when(
+                    F.col("is_high_hprd") == True,
+                    1
+                ).otherwise(0)
+            ).alias("high_hprd_days"),
+    
+            F.sum(
+                F.when(
+                    F.col("is_extreme_hprd") == True,
+                    1
+                ).otherwise(0)
+            ).alias("extreme_hprd_days")
+        )
+    )
+    
+    # ------------------------------------------
+    # Step 3: Calculate HPRD metrics
+    # ------------------------------------------
+    
+    facility_hprd_df = (
+        facility_hprd_df
+        .withColumn(
+            "nursing_hprd",
+            F.when(
+                F.col("eligible_resident_days") > 0,
+                F.col("eligible_nursing_hours")
+                / F.col("eligible_resident_days")
+            )
+        )
+        .withColumn(
+            "employee_hprd",
+            F.when(
+                F.col("eligible_resident_days") > 0,
+                F.col("eligible_employee_hours")
+                / F.col("eligible_resident_days")
+            )
+        )
+        .withColumn(
+            "contract_hprd",
+            F.when(
+                F.col("eligible_resident_days") > 0,
+                F.col("eligible_contract_hours")
+                / F.col("eligible_resident_days")
+            )
+        )
+    )
+    
+    # ------------------------------------------
+    # Step 4: Validate the aggregation
+    # ------------------------------------------
+    
+    print("Nursing HPRD aggregation completed.")
+    
+    print(
+        "Facility-quarter records:",
+        facility_hprd_df.count()
+    )
+    
+    facility_hprd_df.select(
+        "facility_id",
+        "year",
+        "quarter",
+        "total_staffing_days",
+        "valid_census_days",
+        "excluded_census_days",
+        "eligible_resident_days",
+        "nursing_hprd",
+        "employee_hprd",
+        "contract_hprd"
+    ).show(10, truncate=False)
+    
+    # ------------------------------------------
+    # Step 5: Validate record preservation
+    # ------------------------------------------
+    
+    validation_df = facility_hprd_df.agg(
+        F.sum("total_staffing_days")
+            .alias("total_staffing_days"),
+    
+        F.sum("valid_census_days")
+            .alias("total_valid_census_days"),
+    
+        F.sum("excluded_census_days")
+            .alias("total_excluded_census_days"),
+    
+        F.sum("high_hprd_days")
+            .alias("total_high_hprd_days"),
+    
+        F.sum("extreme_hprd_days")
+            .alias("total_extreme_hprd_days")
+    )
+    
+    validation_df.show(truncate=False)
+    
+    
+    # ==========================================
+    # Enrich Nursing HPRD with Facility Details
+    # and State/National Benchmarks
+    # ==========================================
+    
+    # ------------------------------------------
+    # Step 1: Prepare facility dimension
+    # ------------------------------------------
+    
+    facility_details_df = facility_df.select(
+        "facility_id",
+        "facility_name",
+        "state",
+        "ownership_type",
+        "certified_beds",
+        "overall_rating",
+        "staffing_rating"
+    )
+    
+    # ------------------------------------------
+    # Step 2: Prepare state benchmarks
+    # ------------------------------------------
+    
+    state_benchmarks_df = (
+        benchmark_df
+        .filter(F.col("geography_type") == "STATE")
+        .select(
+            F.col("geography_code").alias("benchmark_state"),
+            F.col("total_hprd").alias("state_benchmark_hprd"),
+            F.col("processing_date").alias(
+                "state_benchmark_processing_date"
+            )
+        )
+    )
+    
+    # ------------------------------------------
+    # Step 3: Prepare national benchmark
+    # ------------------------------------------
+    
+    national_benchmark_df = (
+        benchmark_df
+        .filter(F.col("geography_type") == "NATIONAL")
+        .select(
+            F.col("total_hprd").alias("national_benchmark_hprd"),
+            F.col("processing_date").alias(
+                "national_benchmark_processing_date"
+            )
+        )
+    )
+    
+    # ------------------------------------------
+    # Step 4: Join facility details
+    # ------------------------------------------
+    
+    nursing_hprd_gold_df = (
+        facility_hprd_df.alias("h")
+        .join(
+            facility_details_df.alias("f"),
+            F.col("h.facility_id") == F.col("f.facility_id"),
+            "left"
+        )
+        .select(
+            F.col("h.*"),
+            F.col("f.facility_name"),
+            F.col("f.state"),
+            F.col("f.ownership_type"),
+            F.col("f.certified_beds"),
+            F.col("f.overall_rating"),
+            F.col("f.staffing_rating")
+        )
+    )
+    
+    # ------------------------------------------
+    # Step 5: Join state benchmarks
+    # ------------------------------------------
+    
+    nursing_hprd_gold_df = (
+        nursing_hprd_gold_df
+        .join(
+            state_benchmarks_df,
+            F.col("state") == F.col("benchmark_state"),
+            "left"
+        )
+        .drop("benchmark_state")
+    )
+    
+    # ------------------------------------------
+    # Step 6: Join national benchmark
+    # ------------------------------------------
+    
+    nursing_hprd_gold_df = (
+        nursing_hprd_gold_df
+        .crossJoin(national_benchmark_df)
+    )
+    
+    # ------------------------------------------
+    # Step 7: Calculate benchmark differences
+    # ------------------------------------------
+    
+    nursing_hprd_gold_df = (
+        nursing_hprd_gold_df
+        .withColumn(
+            "state_hprd_difference",
+            F.col("nursing_hprd")
+            - F.col("state_benchmark_hprd")
+        )
+        .withColumn(
+            "national_hprd_difference",
+            F.col("nursing_hprd")
+            - F.col("national_benchmark_hprd")
+        )
+    )
+    
+    # ------------------------------------------
+    # Step 8: Validate enriched records
+    # ------------------------------------------
+    
+    print("Nursing HPRD enrichment completed.")
+    
+    nursing_hprd_gold_df.agg(
+        F.count("*").alias("total_records"),
+    
+        F.countDistinct("facility_id")
+            .alias("unique_facilities"),
+    
+        F.sum(
+            F.when(
+                F.col("facility_name").isNull(), 1
+            ).otherwise(0)
+        ).alias("missing_facility_details"),
+    
+        F.sum(
+            F.when(
+                F.col("state_benchmark_hprd").isNull(), 1
+            ).otherwise(0)
+        ).alias("missing_state_benchmarks"),
+    
+        F.sum(
+            F.when(
+                F.col("national_benchmark_hprd").isNull(), 1
+            ).otherwise(0)
+        ).alias("missing_national_benchmarks")
+    ).show(truncate=False)
+    
+    nursing_hprd_gold_df.select(
+        "facility_id",
+        "facility_name",
+        "state",
+        "year",
+        "quarter",
+        "nursing_hprd",
+        "state_benchmark_hprd",
+        "national_benchmark_hprd",
+        "state_hprd_difference",
+        "national_hprd_difference"
+    ).show(10, truncate=False)
+    
+    
+    # ==========================================
+    # Publish Gold: nursing_hprd
+    # ==========================================
+    
+    gold_table_name = "nursing_hprd"
+    
+    run_id = datetime.now(timezone.utc).strftime(
+        "%Y%m%dT%H%M%S%fZ"
+    )
+    
+    gold_s3_path = (
+        f"s3://{S3_BUCKET}/{GOLD_PREFIX}/"
+        f"{gold_table_name}/runs/{run_id}/"
+    )
+    
+    # ------------------------------------------
+    # Step 1: Write Parquet snapshot
+    # ------------------------------------------
+    
+    (
+        nursing_hprd_gold_df
+        .write
+        .mode("errorifexists")
+        .option("compression", "snappy")
+        .parquet(gold_s3_path)
+    )
+    
+    print(f"Gold Parquet written to: {gold_s3_path}")
+    
+    # ------------------------------------------
+    # Step 2: Read back and validate
+    # ------------------------------------------
+    
+    written_gold_df = spark.read.parquet(
+        gold_s3_path
+    )
+    
+    written_count = written_gold_df.count()
+    
+    source_count = nursing_hprd_gold_df.count()
+    
+    if written_count != source_count:
+        raise ValueError(
+            f"Gold count mismatch: "
+            f"source={source_count}, "
+            f"written={written_count}"
+        )
+    
+    if written_count <= 0:
+        raise ValueError(
+            f"{gold_table_name}: Output contains no records"
+        )
+    
+    print(
+        f"Gold snapshot verified: "
+        f"{written_count} records"
+    )
+    
+    # ------------------------------------------
+    # Step 3: Verify S3 output files
+    # ------------------------------------------
+    
+    s3_client = boto3.client("s3")
+    
+    s3_prefix = (
+        f"{GOLD_PREFIX}/{gold_table_name}/runs/{run_id}/"
+    )
+    
+    response = s3_client.list_objects_v2(
+        Bucket=S3_BUCKET,
+        Prefix=s3_prefix
+    )
+    
+    objects = response.get("Contents", [])
+    
+    parquet_files = [
+        obj for obj in objects
+        if obj["Key"].endswith(".parquet")
+        and obj["Size"] > 0
+    ]
+    
+    if not parquet_files:
+        raise ValueError(
+            "No nonempty Parquet files found."
+        )
+    
+    print(
+        f"Verified {len(parquet_files)} "
+        f"nonempty Parquet files."
+    )
+    
+    # ------------------------------------------
+    # Step 4: Create success marker
+    # ------------------------------------------
+    
+    s3_client.put_object(
+        Bucket=S3_BUCKET,
+        Key=f"{s3_prefix}_SUCCESS",
+        Body=b""
+    )
+    
+    print("Gold _SUCCESS marker created.")
+    
+    # ------------------------------------------
+    # Step 5: Register Glue Catalog table
+    # ------------------------------------------
+    
+    glue_client = boto3.client("glue")
+    
+    gold_columns = [
+        {
+            "Name": field.name,
+            "Type": field.dataType.simpleString()
+        }
+        for field in written_gold_df.schema.fields
+    ]
+    
+    table_input = {
+        "Name": gold_table_name,
+        "TableType": "EXTERNAL_TABLE",
+        "Parameters": {
+            "classification": "parquet",
+            "EXTERNAL": "TRUE",
+            "parquet.compression": "snappy"
+        },
+        "StorageDescriptor": {
+            "Columns": gold_columns,
+            "Location": gold_s3_path,
+            "InputFormat": (
+                "org.apache.hadoop.hive.ql.io.parquet."
+                "MapredParquetInputFormat"
+            ),
+            "OutputFormat": (
+                "org.apache.hadoop.hive.ql.io.parquet."
+                "MapredParquetOutputFormat"
+            ),
+            "SerdeInfo": {
+                "SerializationLibrary": (
+                    "org.apache.hadoop.hive.ql.io.parquet."
+                    "serde.ParquetHiveSerDe"
+                )
+            }
+        }
+    }
+    
+    try:
+        glue_client.get_table(
+            DatabaseName=GOLD_DATABASE,
+            Name=gold_table_name
+        )
+    
+        glue_client.update_table(
+            DatabaseName=GOLD_DATABASE,
+            TableInput=table_input
+        )
+    
+        print("Updated existing nursing_hprd table.")
+    
+    except glue_client.exceptions.EntityNotFoundException:
+        glue_client.create_table(
+            DatabaseName=GOLD_DATABASE,
+            TableInput=table_input
+        )
+    
+        print("Created nursing_hprd table.")
+    
+    print(
+        f"Registered {GOLD_DATABASE}."
+        f"{gold_table_name}"
+    )
+    
+    
+    # ==========================================
+    # GOLD METRIC 2: Contract Labor Utilization
+    # ==========================================
+    
+    # ------------------------------------------
+    # Step 1: Prepare daily staffing data
+    # ------------------------------------------
+    
+    contract_daily_df = (
+        staffing_df.alias("s")
+        .join(
+            date_df.alias("d"),
+            F.col("s.date_id") == F.col("d.date_id"),
+            "left"
+        )
+        .select(
+            F.col("s.facility_id"),
+            F.col("d.year"),
+            F.col("d.quarter"),
+            F.col("s.total_nursing_hours"),
+            F.col("s.total_employee_hours"),
+            F.col("s.total_contract_hours"),
+            F.col("s.is_zero_staffing")
+        )
+    )
+    
+    # ------------------------------------------
+    # Step 2: Aggregate by facility and quarter
+    # ------------------------------------------
+    
+    contract_utilization_df = (
+        contract_daily_df
+        .groupBy(
+            "facility_id",
+            "year",
+            "quarter"
+        )
+        .agg(
+            F.count("*").alias("total_staffing_days"),
+    
+            F.sum("total_nursing_hours")
+                .alias("total_nursing_hours"),
+    
+            F.sum("total_employee_hours")
+                .alias("total_employee_hours"),
+    
+            F.sum("total_contract_hours")
+                .alias("total_contract_hours"),
+    
+            F.sum(
+                F.when(
+                    F.col("is_zero_staffing") == True,
+                    1
+                ).otherwise(0)
+            ).alias("zero_staffing_days")
+        )
+    )
+    
+    # ------------------------------------------
+    # Step 3: Calculate contract utilization
+    # ------------------------------------------
+    
+    contract_utilization_df = (
+        contract_utilization_df
+        .withColumn(
+            "contract_utilization_rate",
+            F.when(
+                F.col("total_nursing_hours") > 0,
+                (
+                    F.col("total_contract_hours")
+                    / F.col("total_nursing_hours")
+                ) * 100
+            )
+        )
+        .withColumn(
+            "employee_utilization_rate",
+            F.when(
+                F.col("total_nursing_hours") > 0,
+                (
+                    F.col("total_employee_hours")
+                    / F.col("total_nursing_hours")
+                ) * 100
+            )
+        )
+    )
+    
+    # ------------------------------------------
+    # Step 4: Validate aggregation
+    # ------------------------------------------
+    
+    print("Contract labor aggregation completed.")
+    
+    contract_utilization_df.agg(
+        F.count("*").alias("facility_quarter_records"),
+    
+        F.countDistinct("facility_id")
+            .alias("unique_facilities"),
+    
+        F.sum("total_staffing_days")
+            .alias("total_staffing_days"),
+    
+        F.sum("zero_staffing_days")
+            .alias("total_zero_staffing_days"),
+    
+        F.sum(
+            F.when(
+                F.col("contract_utilization_rate").isNull(),
+                1
+            ).otherwise(0)
+        ).alias("null_contract_rates")
+    ).show(truncate=False)
+    
+    contract_utilization_df.select(
+        "facility_id",
+        "year",
+        "quarter",
+        "total_nursing_hours",
+        "total_employee_hours",
+        "total_contract_hours",
+        "contract_utilization_rate",
+        "employee_utilization_rate"
+    ).show(10, truncate=False)
+    
+    
+    # ==========================================
+    # Enrich Contract Labor Utilization
+    # ==========================================
+    
+    # ------------------------------------------
+    # Step 1: Join facility dimension
+    # ------------------------------------------
+    
+    contract_utilization_gold_df = (
+        contract_utilization_df.alias("c")
+        .join(
+            facility_details_df.alias("f"),
+            F.col("c.facility_id") == F.col("f.facility_id"),
+            "left"
+        )
+        .select(
+            F.col("c.*"),
+            F.col("f.facility_name"),
+            F.col("f.state"),
+            F.col("f.ownership_type"),
+            F.col("f.certified_beds"),
+            F.col("f.overall_rating"),
+            F.col("f.staffing_rating")
+        )
+    )
+    
+    # ------------------------------------------
+    # Step 2: Calculate utilization checks
+    # ------------------------------------------
+    
+    contract_utilization_gold_df = (
+        contract_utilization_gold_df
+        .withColumn(
+            "combined_utilization_rate",
+            F.col("contract_utilization_rate")
+            + F.col("employee_utilization_rate")
+        )
+        .withColumn(
+            "contract_hours_difference",
+            F.col("total_nursing_hours")
+            - (
+                F.col("total_employee_hours")
+                + F.col("total_contract_hours")
+            )
+        )
+    )
+    
+    # ------------------------------------------
+    # Step 3: Validate enriched data
+    # ------------------------------------------
+    
+    print("Contract Labor Utilization enrichment completed.")
+    
+    contract_utilization_gold_df.agg(
+        F.count("*").alias("total_records"),
+    
+        F.countDistinct("facility_id")
+            .alias("unique_facilities"),
+    
+        F.sum(
+            F.when(
+                F.col("facility_name").isNull(), 1
+            ).otherwise(0)
+        ).alias("missing_facility_details"),
+    
+        F.sum(
+            F.when(
+                F.abs(
+                    F.col("combined_utilization_rate") - 100
+                ) > 0.01,
+                1
+            ).otherwise(0)
+        ).alias("invalid_utilization_totals"),
+    
+        F.sum(
+            F.when(
+                F.abs(
+                    F.col("contract_hours_difference")
+                ) > 0.01,
+                1
+            ).otherwise(0)
+        ).alias("hour_reconciliation_errors")
+    ).show(truncate=False)
+    
+    contract_utilization_gold_df.select(
+        "facility_id",
+        "facility_name",
+        "state",
+        "year",
+        "quarter",
+        "total_nursing_hours",
+        "total_contract_hours",
+        "contract_utilization_rate",
+        "employee_utilization_rate",
+        "combined_utilization_rate"
+    ).show(10, truncate=False)
+    
+    
+    # ==========================================
+    # Publish Gold: contract_labor_utilization
+    # ==========================================
+    
+    contract_table_name = "contract_labor_utilization"
+    
+    contract_run_id = datetime.now(
+        timezone.utc
+    ).strftime("%Y%m%dT%H%M%S%fZ")
+    
+    contract_s3_path = (
+        f"s3://{S3_BUCKET}/{GOLD_PREFIX}/"
+        f"{contract_table_name}/runs/{contract_run_id}/"
+    )
+    
+    # ------------------------------------------
+    # Step 1: Write Parquet snapshot
+    # ------------------------------------------
+    
+    (
+        contract_utilization_gold_df
+        .write
+        .mode("errorifexists")
+        .option("compression", "snappy")
+        .parquet(contract_s3_path)
+    )
+    
+    print(
+        f"Contract Labor Utilization written to: "
+        f"{contract_s3_path}"
+    )
+    
+    # ------------------------------------------
+    # Step 2: Read back and validate
+    # ------------------------------------------
+    
+    written_contract_df = spark.read.parquet(
+        contract_s3_path
+    )
+    
+    source_count = contract_utilization_gold_df.count()
+    written_count = written_contract_df.count()
+    
+    if source_count != written_count:
+        raise ValueError(
+            f"Contract utilization count mismatch: "
+            f"source={source_count}, "
+            f"written={written_count}"
+        )
+    
+    if written_count <= 0:
+        raise ValueError(
+            f"{contract_table_name}: Output contains no records"
+        )
+        
+    print(
+        f"Contract utilization snapshot verified: "
+        f"{written_count} records"
+    )
+    
+    # ------------------------------------------
+    # Step 3: Verify S3 Parquet files
+    # ------------------------------------------
+    
+    contract_prefix = (
+        f"{GOLD_PREFIX}/{contract_table_name}/runs/"
+        f"{contract_run_id}/"
+    )
+    
+    paginator = s3_client.get_paginator(
+        "list_objects_v2"
+    )
+    
+    parquet_files = []
+    
+    for page in paginator.paginate(
+        Bucket=S3_BUCKET,
+        Prefix=contract_prefix
+    ):
+        parquet_files.extend(
+            obj for obj in page.get("Contents", [])
+            if obj["Key"].endswith(".parquet")
+            and obj["Size"] > 0
+        )
+    
+    if not parquet_files:
+        raise ValueError(
+            "No nonempty contract utilization "
+            "Parquet files found."
+        )
+    
+    print(
+        f"Verified {len(parquet_files)} "
+        f"nonempty Parquet files."
+    )
+    
+    # ------------------------------------------
+    # Step 4: Create success marker
+    # ------------------------------------------
+    
+    s3_client.put_object(
+        Bucket=S3_BUCKET,
+        Key=f"{contract_prefix}_SUCCESS",
+        Body=b""
+    )
+    
+    print(
+        "Contract utilization _SUCCESS "
+        "marker created."
+    )
+    
+    # ------------------------------------------
+    # Step 5: Register Glue Catalog table
+    # ------------------------------------------
+    
+    contract_columns = [
+        {
+            "Name": field.name,
+            "Type": field.dataType.simpleString()
+        }
+        for field in written_contract_df.schema.fields
+    ]
+    
+    contract_table_input = {
+        "Name": contract_table_name,
+        "TableType": "EXTERNAL_TABLE",
+        "Parameters": {
+            "classification": "parquet",
+            "EXTERNAL": "TRUE",
+            "parquet.compression": "snappy"
+        },
+        "StorageDescriptor": {
+            "Columns": contract_columns,
+            "Location": contract_s3_path,
+            "InputFormat": (
+                "org.apache.hadoop.hive.ql.io.parquet."
+                "MapredParquetInputFormat"
+            ),
+            "OutputFormat": (
+                "org.apache.hadoop.hive.ql.io.parquet."
+                "MapredParquetOutputFormat"
+            ),
+            "SerdeInfo": {
+                "SerializationLibrary": (
+                    "org.apache.hadoop.hive.ql.io.parquet."
+                    "serde.ParquetHiveSerDe"
+                )
+            }
+        }
+    }
+    
+    try:
+        glue_client.get_table(
+            DatabaseName=GOLD_DATABASE,
+            Name=contract_table_name
+        )
+    
+        glue_client.update_table(
+            DatabaseName=GOLD_DATABASE,
+            TableInput=contract_table_input
+        )
+    
+        print(
+            "Updated existing "
+            "contract_labor_utilization table."
+        )
+    
+    except glue_client.exceptions.EntityNotFoundException:
+        glue_client.create_table(
+            DatabaseName=GOLD_DATABASE,
+            TableInput=contract_table_input
+        )
+    
+        print(
+            "Created contract_labor_utilization table."
+        )
+    
+    print(
+        f"Registered {GOLD_DATABASE}."
+        f"{contract_table_name}"
+    )
+    
+    
+    # ==========================================
+    # GOLD METRIC 3: Daily Staffing Variability
+    # ==========================================
+    
+    # ------------------------------------------
+    # Step 1: Prepare daily HPRD records
+    # ------------------------------------------
+    
+    variability_daily_df = (
+        staffing_df.alias("s")
+        .join(
+            date_df.alias("d"),
+            F.col("s.date_id") == F.col("d.date_id"),
+            "left"
+        )
+        .select(
+            F.col("s.facility_id"),
+            F.col("d.year"),
+            F.col("d.quarter"),
+            F.col("s.total_hprd"),
+            F.col("s.resident_census"),
+            F.col("s.is_high_hprd"),
+            F.col("s.is_extreme_hprd")
+        )
+    )
+    
+    # ------------------------------------------
+    # Step 2: Aggregate by facility and quarter
+    # ------------------------------------------
+    
+    daily_variability_df = (
+        variability_daily_df
+        .groupBy(
+            "facility_id",
+            "year",
+            "quarter"
+        )
+        .agg(
+            F.count("*").alias("total_staffing_days"),
+    
+            F.count(
+                F.when(
+                    (F.col("resident_census") > 0)
+                    & F.col("total_hprd").isNotNull(),
+                    F.col("total_hprd")
+                )
+            ).alias("valid_hprd_days"),
+    
+            F.avg(
+                F.when(
+                    F.col("resident_census") > 0,
+                    F.col("total_hprd")
+                )
+            ).alias("avg_daily_hprd"),
+    
+            F.stddev_samp(
+                F.when(
+                    F.col("resident_census") > 0,
+                    F.col("total_hprd")
+                )
+            ).alias("stddev_daily_hprd"),
+    
+            F.min(
+                F.when(
+                    F.col("resident_census") > 0,
+                    F.col("total_hprd")
+                )
+            ).alias("min_daily_hprd"),
+    
+            F.max(
+                F.when(
+                    F.col("resident_census") > 0,
+                    F.col("total_hprd")
+                )
+            ).alias("max_daily_hprd"),
+    
+            F.sum(
+                F.when(
+                    F.col("is_high_hprd") == True, 1
+                ).otherwise(0)
+            ).alias("high_hprd_days"),
+    
+            F.sum(
+                F.when(
+                    F.col("is_extreme_hprd") == True, 1
+                ).otherwise(0)
+            ).alias("extreme_hprd_days")
+        )
+    )
+    
+    # ------------------------------------------
+    # Step 3: Calculate variability metrics
+    # ------------------------------------------
+    
+    daily_variability_df = (
+        daily_variability_df
+        .withColumn(
+            "hprd_coefficient_of_variation",
+            F.when(
+                (F.col("valid_hprd_days") >= 2)
+                & (F.col("avg_daily_hprd") > 0),
+                (
+                    F.col("stddev_daily_hprd")
+                    / F.col("avg_daily_hprd")
+                ) * 100
+            )
+        )
+        .withColumn(
+            "hprd_range",
+            F.col("max_daily_hprd")
+            - F.col("min_daily_hprd")
+        )
+        .withColumn(
+            "excluded_hprd_days",
+            F.col("total_staffing_days")
+            - F.col("valid_hprd_days")
+        )
+    )
+    
+    # ------------------------------------------
+    # Step 4: Validate aggregation
+    # ------------------------------------------
+    
+    print("Daily Staffing Variability aggregation completed.")
+    
+    daily_variability_df.agg(
+        F.count("*").alias("facility_quarter_records"),
+    
+        F.countDistinct("facility_id")
+            .alias("unique_facilities"),
+    
+        F.sum("total_staffing_days")
+            .alias("total_staffing_days"),
+    
+        F.sum("valid_hprd_days")
+            .alias("valid_hprd_days"),
+    
+        F.sum("excluded_hprd_days")
+            .alias("excluded_hprd_days"),
+    
+        F.sum("high_hprd_days")
+            .alias("high_hprd_days"),
+    
+        F.sum("extreme_hprd_days")
+            .alias("extreme_hprd_days"),
+    
+        F.count(
+            F.when(
+                F.col("hprd_coefficient_of_variation").isNull(),
+                1
+            )
+        ).alias("null_cv_records")
+    ).show(truncate=False)
+    
+    daily_variability_df.select(
+        "facility_id",
+        "year",
+        "quarter",
+        "valid_hprd_days",
+        "avg_daily_hprd",
+        "stddev_daily_hprd",
+        "hprd_coefficient_of_variation",
+        "min_daily_hprd",
+        "max_daily_hprd",
+        "hprd_range"
+    ).show(10, truncate=False)
+    
+    
+    # ==========================================
+    # Enrich Daily Staffing Variability
+    # ==========================================
+    
+    # ------------------------------------------
+    # Step 1: Join facility dimension
+    # ------------------------------------------
+    
+    daily_variability_gold_df = (
+        daily_variability_df.alias("v")
+        .join(
+            facility_details_df.alias("f"),
+            F.col("v.facility_id") == F.col("f.facility_id"),
+            "left"
+        )
+        .select(
+            F.col("v.*"),
+            F.col("f.facility_name"),
+            F.col("f.state"),
+            F.col("f.ownership_type"),
+            F.col("f.certified_beds"),
+            F.col("f.overall_rating"),
+            F.col("f.staffing_rating")
+        )
+    )
+    
+    # ------------------------------------------
+    # Step 2: Add data-quality indicators
+    # ------------------------------------------
+    
+    daily_variability_gold_df = (
+        daily_variability_gold_df
+        .withColumn(
+            "has_facility_details",
+            F.col("facility_name").isNotNull()
+        )
+        .withColumn(
+            "has_extreme_hprd",
+            F.col("extreme_hprd_days") > 0
+        )
+        .withColumn(
+            "valid_hprd_percentage",
+            F.when(
+                F.col("total_staffing_days") > 0,
+                (
+                    F.col("valid_hprd_days")
+                    / F.col("total_staffing_days")
+                ) * 100
+            )
+        )
+    )
+    
+    # ------------------------------------------
+    # Step 3: Validate enriched records
+    # ------------------------------------------
+    
+    print("Daily Staffing Variability enrichment completed.")
+    
+    daily_variability_gold_df.agg(
+        F.count("*").alias("total_records"),
+    
+        F.countDistinct("facility_id")
+            .alias("unique_facilities"),
+    
+        F.count(
+            F.when(
+                F.col("facility_name").isNull(), 1
+            )
+        ).alias("missing_facility_details"),
+    
+        F.count(
+            F.when(
+                F.col("hprd_coefficient_of_variation").isNull(),
+                1
+            )
+        ).alias("null_cv_records"),
+    
+        F.count(
+            F.when(
+                F.col("hprd_coefficient_of_variation") < 0,
+                1
+            )
+        ).alias("negative_cv_records"),
+    
+        F.count(
+            F.when(
+                (F.col("valid_hprd_percentage") < 0)
+                | (F.col("valid_hprd_percentage") > 100),
+                1
+            )
+        ).alias("invalid_percentage_records")
+    ).show(truncate=False)
+    
+    daily_variability_gold_df.select(
+        "facility_id",
+        "facility_name",
+        "state",
+        "year",
+        "quarter",
+        "avg_daily_hprd",
+        "stddev_daily_hprd",
+        "hprd_coefficient_of_variation",
+        "valid_hprd_percentage",
+        "has_extreme_hprd"
+    ).show(10, truncate=False)
+    
+    
+    # ==========================================
+    # Publish Gold: daily_staffing_variability
+    # ==========================================
+    
+    variability_table_name = "daily_staffing_variability"
+    
+    variability_run_id = datetime.now(
+        timezone.utc
+    ).strftime("%Y%m%dT%H%M%S%fZ")
+    
+    variability_s3_path = (
+        f"s3://{S3_BUCKET}/{GOLD_PREFIX}/"
+        f"{variability_table_name}/runs/{variability_run_id}/"
+    )
+    
+    # ------------------------------------------
+    # Step 1: Write Parquet snapshot
+    # ------------------------------------------
+    
+    (
+        daily_variability_gold_df
+        .write
+        .mode("errorifexists")
+        .option("compression", "snappy")
+        .parquet(variability_s3_path)
+    )
+    
+    print(
+        f"Daily Staffing Variability written to: "
+        f"{variability_s3_path}"
+    )
+    
+    # ------------------------------------------
+    # Step 2: Read back and validate
+    # ------------------------------------------
+    
+    written_variability_df = spark.read.parquet(
+        variability_s3_path
+    )
+    
+    source_count = daily_variability_gold_df.count()
+    written_count = written_variability_df.count()
+    
+    if source_count != written_count:
+        raise ValueError(
+            f"Variability count mismatch: "
+            f"source={source_count}, "
+            f"written={written_count}"
+        )
+    
+    if written_count <= 0:
+        raise ValueError(
+            f"{variability_table_name}: Output contains no records"
+        )
+    
+    print(
+        f"Variability snapshot verified: "
+        f"{written_count} records"
+    )
+    
+    # ------------------------------------------
+    # Step 3: Verify S3 Parquet files
+    # ------------------------------------------
+    
+    variability_prefix = (
+        f"{GOLD_PREFIX}/{variability_table_name}/runs/"
+        f"{variability_run_id}/"
+    )
+    
+    paginator = s3_client.get_paginator(
+        "list_objects_v2"
+    )
+    
+    parquet_files = []
+    
+    for page in paginator.paginate(
+        Bucket=S3_BUCKET,
+        Prefix=variability_prefix
+    ):
+        parquet_files.extend(
+            obj for obj in page.get("Contents", [])
+            if obj["Key"].endswith(".parquet")
+            and obj["Size"] > 0
+        )
+    
+    if not parquet_files:
+        raise ValueError(
+            "No nonempty variability Parquet files found."
+        )
+    
+    print(
+        f"Verified {len(parquet_files)} "
+        f"nonempty Parquet files."
+    )
+    
+    # ------------------------------------------
+    # Step 4: Create success marker
+    # ------------------------------------------
+    
+    s3_client.put_object(
+        Bucket=S3_BUCKET,
+        Key=f"{variability_prefix}_SUCCESS",
+        Body=b""
+    )
+    
+    print("Variability _SUCCESS marker created.")
+    
+    # ------------------------------------------
+    # Step 5: Register Glue Catalog table
+    # ------------------------------------------
+    
+    variability_columns = [
+        {
+            "Name": field.name,
+            "Type": field.dataType.simpleString()
+        }
+        for field in written_variability_df.schema.fields
+    ]
+    
+    variability_table_input = {
+        "Name": variability_table_name,
+        "TableType": "EXTERNAL_TABLE",
+        "Parameters": {
+            "classification": "parquet",
+            "EXTERNAL": "TRUE",
+            "parquet.compression": "snappy"
+        },
+        "StorageDescriptor": {
+            "Columns": variability_columns,
+            "Location": variability_s3_path,
+            "InputFormat": (
+                "org.apache.hadoop.hive.ql.io.parquet."
+                "MapredParquetInputFormat"
+            ),
+            "OutputFormat": (
+                "org.apache.hadoop.hive.ql.io.parquet."
+                "MapredParquetOutputFormat"
+            ),
+            "SerdeInfo": {
+                "SerializationLibrary": (
+                    "org.apache.hadoop.hive.ql.io.parquet."
+                    "serde.ParquetHiveSerDe"
+                )
+            }
+        }
+    }
+    
+    try:
+        glue_client.get_table(
+            DatabaseName=GOLD_DATABASE,
+            Name=variability_table_name
+        )
+    
+        glue_client.update_table(
+            DatabaseName=GOLD_DATABASE,
+            TableInput=variability_table_input
+        )
+    
+        print(
+            "Updated existing "
+            "daily_staffing_variability table."
+        )
+    
+    except glue_client.exceptions.EntityNotFoundException:
+        glue_client.create_table(
+            DatabaseName=GOLD_DATABASE,
+            TableInput=variability_table_input
+        )
+    
+        print(
+            "Created daily_staffing_variability table."
+        )
+    
+    print(
+        f"Registered {GOLD_DATABASE}."
+        f"{variability_table_name}"
+    )
+    
+    
+    # ==========================================
+    # GOLD METRIC 4: Weekend vs Weekday Staffing
+    # ==========================================
+    
+    # ------------------------------------------
+    # Step 1: Prepare daily staffing data
+    # ------------------------------------------
+    
+    weekend_daily_df = (
+        staffing_df.alias("s")
+        .join(
+            date_df.alias("d"),
+            F.col("s.date_id") == F.col("d.date_id"),
+            "left"
+        )
+        .select(
+            F.col("s.facility_id"),
+            F.col("d.year"),
+            F.col("d.quarter"),
+            F.col("d.is_weekend"),
+            F.col("s.resident_census"),
+            F.col("s.total_nursing_hours"),
+            F.col("s.rn_hours"),
+            F.col("s.total_employee_hours"),
+            F.col("s.total_contract_hours")
+        )
+    )
+    
+    # ------------------------------------------
+    # Step 2: Aggregate by facility and day type
+    # ------------------------------------------
+    
+    weekend_aggregate_df = (
+        weekend_daily_df
+        .groupBy(
+            "facility_id",
+            "year",
+            "quarter",
+            "is_weekend"
+        )
+        .agg(
+            F.count("*").alias("staffing_days"),
+    
+            F.sum(
+                F.when(
+                    F.col("resident_census") > 0,
+                    F.col("resident_census")
+                ).otherwise(0)
+            ).alias("resident_days"),
+    
+            F.sum(
+                F.when(
+                    F.col("resident_census") > 0,
+                    F.col("total_nursing_hours")
+                ).otherwise(0)
+            ).alias("nursing_hours"),
+    
+            F.sum(
+                F.when(
+                    F.col("resident_census") > 0,
+                    F.col("rn_hours")
+                ).otherwise(0)
+            ).alias("rn_hours"),
+    
+            F.sum(
+                F.when(
+                    F.col("resident_census") > 0,
+                    F.col("total_employee_hours")
+                ).otherwise(0)
+            ).alias("employee_hours"),
+    
+            F.sum(
+                F.when(
+                    F.col("resident_census") > 0,
+                    F.col("total_contract_hours")
+                ).otherwise(0)
+            ).alias("contract_hours")
+        )
+    )
+    
+    # ------------------------------------------
+    # Step 3: Calculate HPRD for each day type
+    # ------------------------------------------
+    
+    weekend_aggregate_df = (
+        weekend_aggregate_df
+        .withColumn(
+            "nursing_hprd",
+            F.when(
+                F.col("resident_days") > 0,
+                F.col("nursing_hours") / F.col("resident_days")
+            )
+        )
+        .withColumn(
+            "rn_hprd",
+            F.when(
+                F.col("resident_days") > 0,
+                F.col("rn_hours") / F.col("resident_days")
+            )
+        )
+    )
+    
+    # ------------------------------------------
+    # Step 4: Validate initial aggregation
+    # ------------------------------------------
+    
+    print("Weekend vs Weekday aggregation completed.")
+    
+    weekend_aggregate_df.agg(
+        F.count("*").alias("facility_day_type_records"),
+    
+        F.countDistinct("facility_id")
+            .alias("unique_facilities"),
+    
+        F.sum("staffing_days")
+            .alias("total_staffing_days"),
+    
+        F.sum(
+            F.when(
+                F.col("is_weekend") == True,
+                F.col("staffing_days")
+            ).otherwise(0)
+        ).alias("weekend_staffing_days"),
+    
+        F.sum(
+            F.when(
+                F.col("is_weekend") == False,
+                F.col("staffing_days")
+            ).otherwise(0)
+        ).alias("weekday_staffing_days"),
+    
+        F.count(
+            F.when(
+                F.col("resident_days") == 0,
+                1
+            )
+        ).alias("zero_resident_day_groups")
+    ).show(truncate=False)
+    
+    weekend_aggregate_df.select(
+        "facility_id",
+        "year",
+        "quarter",
+        "is_weekend",
+        "staffing_days",
+        "resident_days",
+        "nursing_hours",
+        "rn_hours",
+        "nursing_hprd",
+        "rn_hprd"
+    ).show(10, truncate=False)
+    
+    
+    # ==========================================
+    # GOLD METRIC 4: Weekend vs Weekday Comparison
+    # ==========================================
+    
+    # ------------------------------------------
+    # Step 1: Pivot weekend/weekday values
+    # ------------------------------------------
+    
+    weekend_comparison_df = (
+        weekend_aggregate_df
+        .groupBy("facility_id", "year", "quarter")
+        .agg(
+            F.max(
+                F.when(
+                    F.col("is_weekend") == False,
+                    F.col("staffing_days")
+                )
+            ).alias("weekday_staffing_days"),
+    
+            F.max(
+                F.when(
+                    F.col("is_weekend") == True,
+                    F.col("staffing_days")
+                )
+            ).alias("weekend_staffing_days"),
+    
+            F.max(
+                F.when(
+                    F.col("is_weekend") == False,
+                    F.col("nursing_hprd")
+                )
+            ).alias("weekday_nursing_hprd"),
+    
+            F.max(
+                F.when(
+                    F.col("is_weekend") == True,
+                    F.col("nursing_hprd")
+                )
+            ).alias("weekend_nursing_hprd"),
+    
+            F.max(
+                F.when(
+                    F.col("is_weekend") == False,
+                    F.col("rn_hprd")
+                )
+            ).alias("weekday_rn_hprd"),
+    
+            F.max(
+                F.when(
+                    F.col("is_weekend") == True,
+                    F.col("rn_hprd")
+                )
+            ).alias("weekend_rn_hprd")
+        )
+    )
+    
+    # ------------------------------------------
+    # Step 2: Calculate differences
+    # ------------------------------------------
+    
+    weekend_comparison_df = (
+        weekend_comparison_df
+        .withColumn(
+            "nursing_hprd_difference",
+            F.col("weekend_nursing_hprd")
+            - F.col("weekday_nursing_hprd")
+        )
+        .withColumn(
+            "nursing_hprd_pct_difference",
+            F.when(
+                F.col("weekday_nursing_hprd") > 0,
+                (
+                    (
+                        F.col("weekend_nursing_hprd")
+                        - F.col("weekday_nursing_hprd")
+                    )
+                    / F.col("weekday_nursing_hprd")
+                ) * 100
+            )
+        )
+        .withColumn(
+            "rn_hprd_difference",
+            F.col("weekend_rn_hprd")
+            - F.col("weekday_rn_hprd")
+        )
+        .withColumn(
+            "rn_hprd_pct_difference",
+            F.when(
+                F.col("weekday_rn_hprd") > 0,
+                (
+                    (
+                        F.col("weekend_rn_hprd")
+                        - F.col("weekday_rn_hprd")
+                    )
+                    / F.col("weekday_rn_hprd")
+                ) * 100
+            )
+        )
+    )
+    
+    # ------------------------------------------
+    # Step 3: Validate comparison
+    # ------------------------------------------
+    
+    print("Weekend vs Weekday comparison completed.")
+    
+    weekend_comparison_df.agg(
+        F.count("*").alias("total_records"),
+    
+        F.countDistinct("facility_id")
+            .alias("unique_facilities"),
+    
+        F.sum("weekday_staffing_days")
+            .alias("weekday_staffing_days"),
+    
+        F.sum("weekend_staffing_days")
+            .alias("weekend_staffing_days"),
+    
+        F.count(
+            F.when(
+                F.col("nursing_hprd_difference").isNull(),
+                1
+            )
+        ).alias("null_nursing_differences"),
+    
+        F.count(
+            F.when(
+                F.col("nursing_hprd_pct_difference").isNull(),
+                1
+            )
+        ).alias("null_nursing_pct_differences"),
+    
+        F.count(
+            F.when(
+                F.col("rn_hprd_pct_difference").isNull(),
+                1
+            )
+        ).alias("null_rn_pct_differences")
+    ).show(truncate=False)
+    
+    weekend_comparison_df.select(
+        "facility_id",
+        "year",
+        "quarter",
+        "weekday_nursing_hprd",
+        "weekend_nursing_hprd",
+        "nursing_hprd_difference",
+        "nursing_hprd_pct_difference",
+        "weekday_rn_hprd",
+        "weekend_rn_hprd",
+        "rn_hprd_difference",
+        "rn_hprd_pct_difference"
+    ).show(10, truncate=False)
+    
+    
+    # ==========================================
+    # Enrich Weekend vs Weekday Staffing
+    # ==========================================
+    
+    # ------------------------------------------
+    # Step 1: Join facility details
+    # ------------------------------------------
+    
+    weekend_weekday_gold_df = (
+        weekend_comparison_df.alias("w")
+        .join(
+            facility_details_df.alias("f"),
+            F.col("w.facility_id") == F.col("f.facility_id"),
+            "left"
+        )
+        .select(
+            F.col("w.*"),
+            F.col("f.facility_name"),
+            F.col("f.state"),
+            F.col("f.ownership_type"),
+            F.col("f.certified_beds"),
+            F.col("f.overall_rating"),
+            F.col("f.staffing_rating")
+        )
+    )
+    
+    # ------------------------------------------
+    # Step 2: Add comparison indicators
+    # ------------------------------------------
+    
+    weekend_weekday_gold_df = (
+        weekend_weekday_gold_df
+        .withColumn(
+            "has_facility_details",
+            F.col("facility_name").isNotNull()
+        )
+        .withColumn(
+            "lower_weekend_nursing_staffing",
+            F.col("nursing_hprd_difference") < 0
+        )
+        .withColumn(
+            "lower_weekend_rn_staffing",
+            F.col("rn_hprd_difference") < 0
+        )
+        .withColumn(
+            "has_rn_pct_comparison",
+            F.col("rn_hprd_pct_difference").isNotNull()
+        )
+    )
+    
+    # ------------------------------------------
+    # Step 3: Validate enriched records
+    # ------------------------------------------
+    
+    print("Weekend vs Weekday enrichment completed.")
+    
+    weekend_weekday_gold_df.agg(
+        F.count("*").alias("total_records"),
+    
+        F.countDistinct("facility_id")
+            .alias("unique_facilities"),
+    
+        F.count(
+            F.when(
+                F.col("facility_name").isNull(), 1
+            )
+        ).alias("missing_facility_details"),
+    
+        F.count(
+            F.when(
+                F.col("nursing_hprd_difference").isNull(), 1
+            )
+        ).alias("null_nursing_differences"),
+    
+        F.count(
+            F.when(
+                F.col("rn_hprd_pct_difference").isNull(), 1
+            )
+        ).alias("null_rn_pct_differences"),
+    
+        F.sum(
+            F.when(
+                F.col("lower_weekend_nursing_staffing"),
+                1
+            ).otherwise(0)
+        ).alias("facilities_lower_on_weekends"),
+    
+        F.sum(
+            F.when(
+                F.col("lower_weekend_rn_staffing"),
+                1
+            ).otherwise(0)
+        ).alias("facilities_lower_rn_on_weekends")
+    ).show(truncate=False)
+    
+    weekend_weekday_gold_df.select(
+        "facility_id",
+        "facility_name",
+        "state",
+        "year",
+        "quarter",
+        "weekday_nursing_hprd",
+        "weekend_nursing_hprd",
+        "nursing_hprd_pct_difference",
+        "weekday_rn_hprd",
+        "weekend_rn_hprd",
+        "rn_hprd_pct_difference",
+        "lower_weekend_nursing_staffing"
+    ).show(10, truncate=False)
+    
+    
+    # ==========================================
+    # Publish Gold: weekend_weekday_staffing
+    # ==========================================
+    
+    weekend_table_name = "weekend_weekday_staffing"
+    
+    weekend_run_id = datetime.now(
+        timezone.utc
+    ).strftime("%Y%m%dT%H%M%S%fZ")
+    
+    weekend_s3_path = (
+        f"s3://{S3_BUCKET}/{GOLD_PREFIX}/"
+        f"{weekend_table_name}/runs/{weekend_run_id}/"
+    )
+    
+    # ------------------------------------------
+    # Step 1: Write Parquet snapshot
+    # ------------------------------------------
+    
+    (
+        weekend_weekday_gold_df
+        .write
+        .mode("errorifexists")
+        .option("compression", "snappy")
+        .parquet(weekend_s3_path)
+    )
+    
+    print(
+        f"Weekend vs Weekday data written to: "
+        f"{weekend_s3_path}"
+    )
+    
+    # ------------------------------------------
+    # Step 2: Read back and validate
+    # ------------------------------------------
+    
+    written_weekend_df = spark.read.parquet(
+        weekend_s3_path
+    )
+    
+    source_count = weekend_weekday_gold_df.count()
+    written_count = written_weekend_df.count()
+    
+    if source_count != written_count:
+        raise ValueError(
+            f"Weekend comparison count mismatch: "
+            f"source={source_count}, written={written_count}"
+        )
+    
+    if written_count <= 0:
+        raise ValueError(
+            f"{weekend_table_name}: Output contains no records"
+        )
+    
+    print(
+        f"Weekend comparison snapshot verified: "
+        f"{written_count} records"
+    )
+    
+    # ------------------------------------------
+    # Step 3: Verify S3 Parquet files
+    # ------------------------------------------
+    
+    weekend_prefix = (
+        f"{GOLD_PREFIX}/{weekend_table_name}/runs/"
+        f"{weekend_run_id}/"
+    )
+    
+    paginator = s3_client.get_paginator(
+        "list_objects_v2"
+    )
+    
+    parquet_files = []
+    
+    for page in paginator.paginate(
+        Bucket=S3_BUCKET,
+        Prefix=weekend_prefix
+    ):
+        parquet_files.extend(
+            obj for obj in page.get("Contents", [])
+            if obj["Key"].endswith(".parquet")
+            and obj["Size"] > 0
+        )
+    
+    if not parquet_files:
+        raise ValueError(
+            "No nonempty weekend comparison Parquet files found."
+        )
+    
+    print(
+        f"Verified {len(parquet_files)} "
+        f"nonempty Parquet files."
+    )
+    
+    # ------------------------------------------
+    # Step 4: Create success marker
+    # ------------------------------------------
+    
+    s3_client.put_object(
+        Bucket=S3_BUCKET,
+        Key=f"{weekend_prefix}_SUCCESS",
+        Body=b""
+    )
+    
+    print("Weekend comparison _SUCCESS marker created.")
+    
+    # ------------------------------------------
+    # Step 5: Register Glue Catalog table
+    # ------------------------------------------
+    
+    weekend_columns = [
+        {
+            "Name": field.name,
+            "Type": field.dataType.simpleString()
+        }
+        for field in written_weekend_df.schema.fields
+    ]
+    
+    weekend_table_input = {
+        "Name": weekend_table_name,
+        "TableType": "EXTERNAL_TABLE",
+        "Parameters": {
+            "classification": "parquet",
+            "EXTERNAL": "TRUE",
+            "parquet.compression": "snappy"
+        },
+        "StorageDescriptor": {
+            "Columns": weekend_columns,
+            "Location": weekend_s3_path,
+            "InputFormat": (
+                "org.apache.hadoop.hive.ql.io.parquet."
+                "MapredParquetInputFormat"
+            ),
+            "OutputFormat": (
+                "org.apache.hadoop.hive.ql.io.parquet."
+                "MapredParquetOutputFormat"
+            ),
+            "SerdeInfo": {
+                "SerializationLibrary": (
+                    "org.apache.hadoop.hive.ql.io.parquet."
+                    "serde.ParquetHiveSerDe"
+                )
+            }
+        }
+    }
+    
+    try:
+        glue_client.get_table(
+            DatabaseName=GOLD_DATABASE,
+            Name=weekend_table_name
+        )
+    
+        glue_client.update_table(
+            DatabaseName=GOLD_DATABASE,
+            TableInput=weekend_table_input
+        )
+    
+        print(
+            "Updated existing "
+            "weekend_weekday_staffing table."
+        )
+    
+    except glue_client.exceptions.EntityNotFoundException:
+        glue_client.create_table(
+            DatabaseName=GOLD_DATABASE,
+            TableInput=weekend_table_input
+        )
+    
+        print(
+            "Created weekend_weekday_staffing table."
+        )
+    
+    print(
+        f"Registered {GOLD_DATABASE}."
+        f"{weekend_table_name}"
+    )
+    
+    # Additional Gold transformations will go here.
+    
+    job.commit()
+
+else:
+    print(
+        "Gold completed successfully without processing."
+    )
