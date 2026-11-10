@@ -1,0 +1,212 @@
+
+import sys
+import json
+import boto3
+import argparse
+from botocore.exceptions import ClientError
+
+
+parser = argparse.ArgumentParser()
+
+parser.add_argument("--S3_BUCKET", required=True)
+parser.add_argument("--STATE_KEY", required=True)
+parser.add_argument("--WORKFLOW_NAME", required=True)
+parser.add_argument("--WORKFLOW_RUN_ID", required=True)
+
+args, _ = parser.parse_known_args()
+
+args = vars(args)
+
+BUCKET = args["S3_BUCKET"]
+STATE_KEY = args["STATE_KEY"]
+
+glue = boto3.client("glue", region_name="us-east-1")
+s3 = boto3.client("s3", region_name="us-east-1")
+
+# --------------------------------------------------
+# Retrieve the current workflow's ingestion details
+# --------------------------------------------------
+
+properties = glue.get_workflow_run_properties(
+    Name=args["WORKFLOW_NAME"],
+    RunId=args["WORKFLOW_RUN_ID"]
+)["RunProperties"]
+
+run_id = properties.get("INGESTION_RUN_ID")
+manifest_key = properties.get("MANIFEST_KEY")
+
+if not run_id or not manifest_key:
+    raise RuntimeError(
+        "Workflow is missing ingestion run ID or manifest key."
+    )
+
+expected_manifest_key = (
+    f"temp/drive-ingestion/{run_id}/manifest.json"
+)
+
+if manifest_key != expected_manifest_key:
+    raise RuntimeError(
+        "Manifest path does not match the ingestion run ID."
+    )
+
+# --------------------------------------------------
+# Read and validate the ingestion manifest
+# --------------------------------------------------
+
+manifest_obj = s3.get_object(
+    Bucket=BUCKET,
+    Key=manifest_key
+)
+
+manifest = json.loads(
+    manifest_obj["Body"].read().decode("utf-8")
+)
+
+required_datasets = {
+    "pbj_daily_staffing",
+    "data_collection_intervals",
+    "provider_info",
+    "quality_measures_mds",
+    "state_us_averages"
+}
+
+if manifest.get("run_id") != run_id:
+    raise RuntimeError("Manifest run ID mismatch.")
+
+if manifest.get("status") != "complete":
+    raise RuntimeError("Ingestion manifest is incomplete.")
+
+datasets = manifest.get("datasets")
+
+if not isinstance(datasets, dict) or set(datasets) != required_datasets:
+    raise RuntimeError(
+        "Manifest does not contain exactly five required datasets."
+    )
+
+# --------------------------------------------------
+# Read and validate Bronze status
+# --------------------------------------------------
+
+status_key = (
+    f"temp/pipeline-status/{run_id}/bronze-status.json"
+)
+
+status_obj = s3.get_object(
+    Bucket=BUCKET,
+    Key=status_key
+)
+
+bronze_status = json.loads(
+    status_obj["Body"].read().decode("utf-8")
+)
+
+if bronze_status.get("run_id") != run_id:
+    raise RuntimeError("Bronze status run ID mismatch.")
+
+if bronze_status.get("status") != "success":
+    raise RuntimeError("Bronze did not complete successfully.")
+
+changes_detected = bronze_status.get("changes_detected")
+
+if not isinstance(changes_detected, bool):
+    raise RuntimeError("Invalid Bronze change status.")
+
+if bronze_status.get("bronze_processed") is not changes_detected:
+    raise RuntimeError("Inconsistent Bronze processing status.")
+
+# --------------------------------------------------
+# No-change runs do not update the baseline
+# --------------------------------------------------
+
+if not changes_detected:
+    print(
+        "No changes detected. "
+        "Leaving successful-run baseline unchanged."
+    )
+
+else:
+    # --------------------------------------------------
+    # Construct the new successful-run baseline
+    # --------------------------------------------------
+
+    new_datasets = {}
+
+    for dataset_name in sorted(required_datasets):
+        dataset = datasets[dataset_name]
+
+        required_fields = (
+            "google_drive_file_id",
+            "google_drive_modified_time",
+            "google_drive_size"
+        )
+
+        for field in required_fields:
+            if dataset.get(field) is None:
+                raise RuntimeError(
+                    f"Missing {field} for {dataset_name}."
+                )
+
+        new_datasets[dataset_name] = {
+            "google_drive_file_id": dataset["google_drive_file_id"],
+            "google_drive_modified_time": dataset["google_drive_modified_time"],
+            "google_drive_size": str(dataset["google_drive_size"])
+        }
+
+    new_state = {
+        "status": "success",
+        "last_successful_ingestion_run_id": run_id,
+        "datasets": new_datasets
+    }
+
+    # --------------------------------------------------
+    # Prevent stale or duplicate baseline commits
+    # --------------------------------------------------
+
+    try:
+        existing_obj = s3.get_object(
+            Bucket=BUCKET,
+            Key=STATE_KEY
+        )
+
+        existing_state = json.loads(
+            existing_obj["Body"].read().decode("utf-8")
+        )
+
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] != "NoSuchKey":
+            raise
+        raise RuntimeError(
+            "Production baseline is missing; refusing to overwrite."
+        )
+
+    previous_run_id = existing_state.get(
+        "last_successful_ingestion_run_id"
+    )
+
+    if not previous_run_id:
+        raise RuntimeError(
+            "Existing baseline has no successful run ID."
+        )
+
+    if run_id <= previous_run_id:
+        raise RuntimeError(
+            f"Refusing stale baseline commit: "
+            f"{run_id} <= {previous_run_id}"
+        )
+
+    # --------------------------------------------------
+    # Commit successful source state
+    # --------------------------------------------------
+
+    s3.put_object(
+        Bucket=BUCKET,
+        Key=STATE_KEY,
+        Body=json.dumps(new_state, indent=2).encode("utf-8"),
+        ContentType="application/json"
+    )
+
+    print(
+        f"Baseline committed successfully for run {run_id}."
+    )
+
+print("Baseline commit job completed.")
